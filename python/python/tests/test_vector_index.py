@@ -180,6 +180,41 @@ def test_flat(dataset):
     run(dataset)
 
 
+def test_batch_flat_query_matches_repeated_single_queries(dataset):
+    queries = np.random.randn(2, 128).astype(np.float32)
+    k = 5
+
+    batch = dataset.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": queries,
+            "k": k,
+        },
+    )
+
+    assert batch.num_rows == queries.shape[0] * k
+    assert batch.column_names == ["id", "_distance", "_query_index"]
+    assert batch["_query_index"].to_pylist() == [0] * k + [1] * k
+
+    for query_index, query in enumerate(queries):
+        single = dataset.to_table(
+            columns=["id"],
+            nearest={
+                "column": "vector",
+                "q": query,
+                "k": k,
+                "use_index": False,
+            },
+        )
+        batch_slice = batch.filter(pc.field("_query_index") == query_index)
+        assert batch_slice["id"].to_pylist() == single["id"].to_pylist()
+        np.testing.assert_allclose(
+            batch_slice["_distance"].to_numpy(),
+            single["_distance"].to_numpy(),
+        )
+
+
 def test_ann(indexed_dataset):
     run(indexed_dataset)
 

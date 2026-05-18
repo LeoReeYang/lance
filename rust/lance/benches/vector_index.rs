@@ -3,18 +3,19 @@
 #![allow(clippy::print_stdout)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::{
     FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, cast::as_primitive_array,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::TryStreamExt;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
 
-use lance::dataset::{Dataset, WriteMode, WriteParams, builder::DatasetBuilder};
+use lance::dataset::{Dataset, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance_arrow::{FixedSizeListArrayExt, as_fixed_size_list_array};
@@ -22,7 +23,23 @@ use lance_index::{
     IndexType,
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
 };
+use lance_io::object_store::{ObjectStoreParams, WrappingObjectStore};
 use lance_linalg::distance::MetricType;
+use object_store::{
+    ObjectStore,
+    throttle::{ThrottleConfig, ThrottledStore},
+};
+
+#[derive(Debug)]
+struct ThrottledStoreWrapper {
+    config: ThrottleConfig,
+}
+
+impl WrappingObjectStore for ThrottledStoreWrapper {
+    fn wrap(&self, _prefix: &str, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        Arc::new(ThrottledStore::new(original, self.config.clone()))
+    }
+}
 
 fn bench_ivf_pq_index(c: &mut Criterion) {
     // default tokio runtime
@@ -124,6 +141,94 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
     );
 }
 
+fn bench_batch_flat_knn(c: &mut Criterion) {
+    const DIM: i32 = 4;
+    const K: usize = 10;
+    const QUERY_COUNT: usize = 8;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let uri = format!("memory://batch_flat_vec_data_{}", rand::random::<u64>());
+    let dataset = rt.block_on(async {
+        create_flat_file(
+            &uri,
+            WriteMode::Create,
+            50_000,
+            5_000,
+            DIM,
+            Duration::from_millis(5),
+        )
+        .await
+    });
+    let first_batch = rt.block_on(async {
+        dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    let vector_column = first_batch.column_by_name("vector").unwrap();
+    let vectors = as_fixed_size_list_array(vector_column);
+    let query_values = (0..QUERY_COUNT)
+        .flat_map(|query_index| {
+            let values = vectors.value(query_index);
+            as_primitive_array::<arrow_array::types::Float32Type>(&values)
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    let queries =
+        FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), DIM)
+            .unwrap();
+
+    let mut group = c.benchmark_group("batch_flat_knn");
+    group.bench_function(BenchmarkId::new("separate_queries", QUERY_COUNT), |b| {
+        b.to_async(&rt).iter(|| async {
+            for query_index in 0..QUERY_COUNT {
+                let query = Float32Array::from(
+                    query_values[query_index * DIM as usize..(query_index + 1) * DIM as usize]
+                        .to_vec(),
+                );
+                let results = dataset
+                    .scan()
+                    .nearest("vector", &query, K)
+                    .unwrap()
+                    .use_index(false)
+                    .project::<&str>(&[])
+                    .unwrap()
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert!(!results.is_empty());
+            }
+        })
+    });
+    group.bench_function(BenchmarkId::new("batch_query", QUERY_COUNT), |b| {
+        b.to_async(&rt).iter(|| async {
+            let results = dataset
+                .scan()
+                .nearest_batch("vector", &queries, K)
+                .unwrap()
+                .project::<&str>(&[])
+                .unwrap()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert!(!results.is_empty());
+        })
+    });
+    group.finish();
+}
+
 async fn create_file(path: &std::path::Path, mode: WriteMode) {
     let schema = Arc::new(ArrowSchema::new(vec![Field::new(
         "vector",
@@ -187,6 +292,80 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
         .unwrap();
 }
 
+async fn create_flat_file(
+    uri: &str,
+    mode: WriteMode,
+    num_rows: i32,
+    batch_size: i32,
+    dim: i32,
+    wait_get_per_call: Duration,
+) -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "vector",
+        DataType::FixedSizeList(
+            FieldRef::new(Field::new("item", DataType::Float32, true)),
+            dim,
+        ),
+        false,
+    )]));
+
+    let batches: Vec<RecordBatch> = (0..(num_rows / batch_size))
+        .map(|_| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        create_float32_array(batch_size * dim),
+                        dim,
+                    )
+                    .unwrap(),
+                )],
+            )
+            .unwrap()
+        })
+        .collect();
+
+    if !uri.starts_with("memory://") {
+        std::fs::remove_dir_all(uri).map_or_else(|_| println!("{} not exists", uri), |_| {});
+    }
+    let store_params = if wait_get_per_call.is_zero() {
+        None
+    } else {
+        Some(ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(ThrottledStoreWrapper {
+                config: ThrottleConfig {
+                    wait_get_per_call,
+                    ..Default::default()
+                },
+            })),
+            ..Default::default()
+        })
+    };
+    let write_params = WriteParams {
+        max_rows_per_file: num_rows as usize,
+        max_rows_per_group: batch_size as usize,
+        store_params: store_params.clone(),
+        mode,
+        ..Default::default()
+    };
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+    let dataset = Dataset::write(reader, uri, Some(write_params))
+        .await
+        .unwrap();
+    if uri.starts_with("memory://") {
+        dataset
+    } else {
+        DatasetBuilder::from_uri(uri)
+            .with_read_params(ReadParams {
+                store_options: store_params,
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap()
+    }
+}
+
 fn create_float32_array(num_elements: i32) -> Float32Array {
     // generate an Arrow Float32Array with 10000*128 elements randomly
     let mut rng = rand::rng();
@@ -202,12 +381,12 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_ivf_pq_index);
+    targets = bench_ivf_pq_index, bench_batch_flat_knn);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_ivf_pq_index);
+    targets = bench_ivf_pq_index, bench_batch_flat_knn);
 criterion_main!(benches);

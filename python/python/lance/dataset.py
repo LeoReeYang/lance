@@ -92,7 +92,7 @@ if TYPE_CHECKING:
         pa.Array,
         pa.Scalar,
         np.ndarray,
-        Iterable[float],
+        Iterable[Union[float, Iterable[float]]],
     ]
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 _BLOB_PANDAS_MODE_LAZY = "lazy"
@@ -1098,6 +1098,12 @@ class LanceDataset(pa.dataset.Dataset):
                     "refine_factor": 1,
                     "distance_range": (0.0, 1.0),
                 }
+
+            ``q`` may also be a 2-D array-like value for fixed-size vector columns.
+            In that case Lance runs a flat batch KNN query, returns up to ``k`` rows
+            for each query vector, and adds ``_query_index`` to identify the source
+            query for each result row. Indexed/ANN batch search is not used in this
+            first implementation.
 
         batch_size: int, default None
             The maximum number of rows per batch.  In some cases batches can be
@@ -5989,6 +5995,10 @@ class ScannerBuilder:
 
         Parameters
         ----------
+        q: QueryVectorLike
+            A single query vector or, for fixed-size vector columns, a 2-D array-like
+            batch of query vectors. Batch queries return up to ``k`` rows per query
+            and include ``_query_index`` in the output.
         query_parallelism: int, optional
             Maximum partition-search concurrency for a single vector query.
             The default is 0. Value 0 uses the automatic policy, which
@@ -7137,7 +7147,10 @@ def _build_vector_search_query(
     column: str
         The name of the vector column to search.
     q: QueryVectorLike
-        The query vector.
+        The query vector. For fixed-size vector columns, this may be a 2-D
+        array-like batch of query vectors. Batch queries run flat KNN, apply
+        ``k`` per query vector, and add ``_query_index`` to the result so
+        callers can split rows by input query.
     k: int, optional
         The number of nearest neighbors to return.
     metric: str, optional
