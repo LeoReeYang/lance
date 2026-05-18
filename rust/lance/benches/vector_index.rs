@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arrow_array::{
     FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, cast::as_primitive_array,
 };
-use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::TryStreamExt;
 #[cfg(target_os = "linux")]
@@ -125,9 +125,11 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
 }
 
 fn bench_batch_flat_knn(c: &mut Criterion) {
-    const DIM: i32 = 4;
+    const DIM: i32 = 512;
     const K: usize = 10;
-    const QUERY_COUNT: usize = 8;
+    const NUM_ROWS: usize = 1_000_000;
+    const BATCH_SIZE: usize = 10_000;
+    const QUERY_COUNT: usize = 10;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let uri = std::env::temp_dir()
@@ -137,8 +139,9 @@ fn bench_batch_flat_knn(c: &mut Criterion) {
         ))
         .to_string_lossy()
         .to_string();
-    let dataset =
-        rt.block_on(async { create_flat_file(&uri, WriteMode::Create, 50_000, 5_000, DIM).await });
+    let dataset = rt.block_on(async {
+        create_flat_file(&uri, WriteMode::Create, NUM_ROWS, BATCH_SIZE, DIM).await
+    });
     let first_batch = rt.block_on(async {
         dataset
             .scan()
@@ -275,8 +278,8 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
 async fn create_flat_file(
     uri: &str,
     mode: WriteMode,
-    num_rows: i32,
-    batch_size: i32,
+    num_rows: usize,
+    batch_size: usize,
     dim: i32,
 ) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -288,39 +291,62 @@ async fn create_flat_file(
         false,
     )]));
 
-    let batches: Vec<RecordBatch> = (0..(num_rows / batch_size))
-        .map(|_| {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(
-                    FixedSizeListArray::try_new_from_values(
-                        create_float32_array(batch_size * dim),
-                        dim,
-                    )
-                    .unwrap(),
-                )],
+    struct FlatVectorBatchIter {
+        schema: Arc<ArrowSchema>,
+        remaining_rows: usize,
+        batch_size: usize,
+        dim: i32,
+    }
+
+    impl Iterator for FlatVectorBatchIter {
+        type Item = Result<RecordBatch, ArrowError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.remaining_rows == 0 {
+                return None;
+            }
+            let rows = self.remaining_rows.min(self.batch_size);
+            self.remaining_rows -= rows;
+
+            let values = create_float32_array(rows * self.dim as usize);
+            Some(
+                RecordBatch::try_new(
+                    self.schema.clone(),
+                    vec![Arc::new(
+                        FixedSizeListArray::try_new_from_values(values, self.dim).unwrap(),
+                    )],
+                )
+                .map_err(Into::into),
             )
-            .unwrap()
-        })
-        .collect();
+        }
+    }
 
     std::fs::remove_dir_all(uri).map_or_else(|_| println!("{} not exists", uri), |_| {});
     let write_params = WriteParams {
-        max_rows_per_file: num_rows as usize,
-        max_rows_per_group: batch_size as usize,
+        max_rows_per_file: num_rows,
+        max_rows_per_group: batch_size,
         mode,
         ..Default::default()
     };
-    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+    let reader = RecordBatchIterator::new(
+        FlatVectorBatchIter {
+            schema: schema.clone(),
+            remaining_rows: num_rows,
+            batch_size,
+            dim,
+        },
+        schema,
+    );
     Dataset::write(reader, uri, Some(write_params))
         .await
         .unwrap()
 }
 
-fn create_float32_array(num_elements: i32) -> Float32Array {
-    // generate an Arrow Float32Array with 10000*128 elements randomly
+fn create_float32_array(num_elements: usize) -> Float32Array {
+    // Generate random values on demand so large benchmark datasets do not need
+    // to be fully materialized in memory before writing.
     let mut rng = rand::rng();
-    let mut values = Vec::with_capacity(num_elements as usize);
+    let mut values = Vec::with_capacity(num_elements);
     for _ in 0..num_elements {
         values.push(rng.random_range(0.0..1.0));
     }
