@@ -1370,9 +1370,10 @@ impl Dataset {
 
             let (vector_type, element_type) = get_vector_type(self_.ds.schema(), &column)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let is_batch_query =
-                matches!(q.data_type(), DataType::List(_) | DataType::FixedSizeList(_, _))
-                    && matches!(vector_type, DataType::FixedSizeList(_, _));
+            let is_batch_query = matches!(
+                q.data_type(),
+                DataType::List(_) | DataType::FixedSizeList(_, _)
+            ) && matches!(vector_type, DataType::FixedSizeList(_, _));
             let scanner = match (is_batch_query, element_type) {
                 (true, DataType::UInt8) => {
                     return Err(PyValueError::new_err(
