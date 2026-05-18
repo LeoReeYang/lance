@@ -125,11 +125,16 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
 }
 
 fn bench_batch_flat_knn(c: &mut Criterion) {
-    const DIM: i32 = 512;
+    const DEFAULT_DIM: i32 = 512;
     const K: usize = 10;
-    const NUM_ROWS: usize = 1_000_000;
-    const BATCH_SIZE: usize = 10_000;
-    const QUERY_COUNT: usize = 10;
+    const DEFAULT_NUM_ROWS: usize = 1_000_000;
+    const DEFAULT_BATCH_SIZE: usize = 10_000;
+    const DEFAULT_QUERY_COUNT: usize = 10;
+
+    let dim = bench_env("LANCE_BATCH_KNN_DIM", DEFAULT_DIM);
+    let num_rows = bench_env("LANCE_BATCH_KNN_ROWS", DEFAULT_NUM_ROWS);
+    let batch_size = bench_env("LANCE_BATCH_KNN_BATCH_SIZE", DEFAULT_BATCH_SIZE);
+    let query_count = bench_env("LANCE_BATCH_KNN_QUERY_COUNT", DEFAULT_QUERY_COUNT);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let uri = std::env::temp_dir()
@@ -140,7 +145,7 @@ fn bench_batch_flat_knn(c: &mut Criterion) {
         .to_string_lossy()
         .to_string();
     let dataset = rt.block_on(async {
-        create_flat_file(&uri, WriteMode::Create, NUM_ROWS, BATCH_SIZE, DIM).await
+        create_flat_file(&uri, WriteMode::Create, num_rows, batch_size, dim).await
     });
     let first_batch = rt.block_on(async {
         dataset
@@ -155,7 +160,7 @@ fn bench_batch_flat_knn(c: &mut Criterion) {
     });
     let vector_column = first_batch.column_by_name("vector").unwrap();
     let vectors = as_fixed_size_list_array(vector_column);
-    let query_values = (0..QUERY_COUNT)
+    let query_values = (0..query_count)
         .flat_map(|query_index| {
             let values = vectors.value(query_index);
             as_primitive_array::<arrow_array::types::Float32Type>(&values)
@@ -164,22 +169,51 @@ fn bench_batch_flat_knn(c: &mut Criterion) {
         })
         .collect::<Vec<_>>();
     let queries =
-        FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), DIM)
+        FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), dim)
             .unwrap();
 
     let mut group = c.benchmark_group("batch_flat_knn");
-    group.bench_function(BenchmarkId::new("separate_queries", QUERY_COUNT), |b| {
-        b.to_async(&rt).iter(|| async {
-            for query_index in 0..QUERY_COUNT {
-                let query = Float32Array::from(
-                    query_values[query_index * DIM as usize..(query_index + 1) * DIM as usize]
-                        .to_vec(),
-                );
+    group.bench_function(
+        BenchmarkId::new(
+            "separate_queries",
+            format!("rows={num_rows},dim={dim},queries={query_count}"),
+        ),
+        |b| {
+            b.to_async(&rt).iter(|| async {
+                for query_index in 0..query_count {
+                    let query = Float32Array::from(
+                        query_values[query_index * dim as usize..(query_index + 1) * dim as usize]
+                            .to_vec(),
+                    );
+                    let results = dataset
+                        .scan()
+                        .nearest("vector", &query, K)
+                        .unwrap()
+                        .use_index(false)
+                        .project::<&str>(&[])
+                        .unwrap()
+                        .try_into_stream()
+                        .await
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap();
+                    assert!(!results.is_empty());
+                }
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "batch_query",
+            format!("rows={num_rows},dim={dim},queries={query_count}"),
+        ),
+        |b| {
+            b.to_async(&rt).iter(|| async {
                 let results = dataset
                     .scan()
-                    .nearest("vector", &query, K)
+                    .nearest("vector", &queries, K)
                     .unwrap()
-                    .use_index(false)
                     .project::<&str>(&[])
                     .unwrap()
                     .try_into_stream()
@@ -189,27 +223,22 @@ fn bench_batch_flat_knn(c: &mut Criterion) {
                     .await
                     .unwrap();
                 assert!(!results.is_empty());
-            }
-        })
-    });
-    group.bench_function(BenchmarkId::new("batch_query", QUERY_COUNT), |b| {
-        b.to_async(&rt).iter(|| async {
-            let results = dataset
-                .scan()
-                .nearest("vector", &queries, K)
-                .unwrap()
-                .project::<&str>(&[])
-                .unwrap()
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            assert!(!results.is_empty());
-        })
-    });
+            })
+        },
+    );
     group.finish();
+    drop(dataset);
+    let _ = std::fs::remove_dir_all(uri);
+}
+
+fn bench_env<T>(key: &str, default: T) -> T
+where
+    T: std::str::FromStr,
+{
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
 }
 
 async fn create_file(path: &std::path::Path, mode: WriteMode) {
@@ -243,8 +272,8 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     let test_uri = path.to_str().unwrap();
     std::fs::remove_dir_all(test_uri).map_or_else(|_| println!("{} not exists", test_uri), |_| {});
     let write_params = WriteParams {
-        max_rows_per_file: num_rows as usize,
-        max_rows_per_group: batch_size as usize,
+        max_rows_per_file: num_rows,
+        max_rows_per_group: batch_size,
         mode,
         ..Default::default()
     };
@@ -309,15 +338,12 @@ async fn create_flat_file(
             self.remaining_rows -= rows;
 
             let values = create_float32_array(rows * self.dim as usize);
-            Some(
-                RecordBatch::try_new(
-                    self.schema.clone(),
-                    vec![Arc::new(
-                        FixedSizeListArray::try_new_from_values(values, self.dim).unwrap(),
-                    )],
-                )
-                .map_err(Into::into),
-            )
+            Some(RecordBatch::try_new(
+                self.schema.clone(),
+                vec![Arc::new(
+                    FixedSizeListArray::try_new_from_values(values, self.dim).unwrap(),
+                )],
+            ))
         }
     }
 
