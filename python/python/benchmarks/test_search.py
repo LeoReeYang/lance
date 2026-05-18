@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
-import os
 import shutil
 from pathlib import Path
 from typing import NamedTuple, Union
@@ -68,13 +67,6 @@ def create_table(num_rows, offset) -> pa.Table:
             "genres": genres,
         }
     )
-
-
-def get_benchmark_env(key: str, default: int) -> int:
-    value = os.environ.get(key)
-    if value is None:
-        return default
-    return int(value)
 
 
 def create_flat_vector_table(num_rows: int, offset: int, dim: int) -> pa.Table:
@@ -224,16 +216,29 @@ def test_knn_search(test_dataset, benchmark):
 
 @pytest.mark.benchmark(group="batch_flat_knn")
 @pytest.mark.parametrize("mode", ["separate", "batch"])
-def test_batch_flat_knn(data_dir: Path, benchmark, mode: str):
-    dim = get_benchmark_env("LANCE_BATCH_KNN_DIM", BATCH_FLAT_KNN_DIM)
-    num_rows = get_benchmark_env("LANCE_BATCH_KNN_ROWS", BATCH_FLAT_KNN_ROWS)
-    batch_size = get_benchmark_env(
-        "LANCE_BATCH_KNN_BATCH_SIZE", BATCH_FLAT_KNN_BATCH_SIZE
-    )
-    query_count = get_benchmark_env(
-        "LANCE_BATCH_KNN_QUERY_COUNT", BATCH_FLAT_KNN_QUERY_COUNT
-    )
-    rounds = get_benchmark_env("LANCE_BATCH_KNN_ROUNDS", 10)
+@pytest.mark.parametrize(
+    ("dim", "num_rows", "batch_size", "query_count", "rounds"),
+    [
+        (
+            BATCH_FLAT_KNN_DIM,
+            BATCH_FLAT_KNN_ROWS,
+            BATCH_FLAT_KNN_BATCH_SIZE,
+            BATCH_FLAT_KNN_QUERY_COUNT,
+            10,
+        )
+    ],
+    ids=["1m_rows_512d_m10"],
+)
+def test_batch_flat_knn(
+    data_dir: Path,
+    benchmark,
+    mode: str,
+    dim: int,
+    num_rows: int,
+    batch_size: int,
+    query_count: int,
+    rounds: int,
+):
     dataset = create_batch_flat_knn_dataset(data_dir, num_rows, batch_size, dim)
     query_table = dataset.to_table(columns=["vector"], limit=query_count)
     query_values = np.asarray(
