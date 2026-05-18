@@ -38,7 +38,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_expr::ExprSchemable;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_functions::core::getfield::GetFieldFunc;
-use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::expressions::{Column, Literal};
 use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::joins::PartitionMode;
 use datafusion_physical_plan::projection::ProjectionExec;
@@ -101,7 +101,7 @@ use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
     LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
-    knn::{KNN_INDEX_SCHEMA, QUERY_INDEX_COL, new_knn_exec},
+    knn::{KNN_INDEX_SCHEMA, KnnBatchParams, QUERY_INDEX_COL, new_knn_exec},
     project,
 };
 use crate::io::exec::{AddRowOffsetExec, LanceFilterExec, LanceScanConfig, get_physical_optimizer};
@@ -3532,6 +3532,7 @@ impl Scanner {
     }
 
     // ANN/KNN search execution node with optional prefilter
+    #[async_recursion]
     async fn vector_search(
         &self,
         filter_plan: &ExprFilterPlan,
@@ -3542,14 +3543,8 @@ impl Scanner {
         // Sanity check
         let (vector_type, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
 
-        if self.nearest_query_count > 1 && self.fast_search {
-            return Err(Error::not_supported(
-                "fast_search is not supported for batch nearest queries".to_string(),
-            ));
-        }
-
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;
-        let use_index = q.use_index && self.nearest_query_count == 1;
+        let use_index = q.use_index;
         let indices = if use_index {
             self.dataset.load_indices().await?
         } else {
@@ -3689,6 +3684,10 @@ impl Scanner {
         };
 
         if let Some((index_name, index_segments, index_metric)) = index_and_segments {
+            if self.nearest_query_count > 1 {
+                return self.batch_indexed_vector_search(filter_plan, &q).await;
+            }
+
             log::trace!("index found for vector search");
             // Use the index's metric type
             q.metric_type = Some(index_metric);
@@ -3764,6 +3763,85 @@ impl Scanner {
             }
             Ok(self.flat_knn(plan, &q)?)
         }
+    }
+
+    async fn batch_indexed_vector_search(
+        &self,
+        filter_plan: &ExprFilterPlan,
+        q: &Query,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let query_dim = q.key.len() / self.nearest_query_count;
+        let mut query_plans = Vec::with_capacity(self.nearest_query_count);
+
+        for query_index in 0..self.nearest_query_count {
+            let mut single_query = q.clone();
+            single_query.key = q.key.slice(query_index * query_dim, query_dim);
+
+            let mut single_scanner = self.clone();
+            single_scanner.nearest_query_count = 1;
+            single_scanner.nearest = Some(single_query.clone());
+
+            let single_plan = single_scanner
+                .vector_search(filter_plan, &single_query)
+                .await?;
+            query_plans.push(Self::add_query_index_column(
+                single_plan,
+                query_index as u32,
+            )?);
+        }
+
+        let unioned = UnionExec::try_new(query_plans)?;
+        let unioned = Arc::new(RepartitionExec::try_new(
+            unioned,
+            Partitioning::RoundRobinBatch(1),
+        )?) as Arc<dyn ExecutionPlan>;
+
+        let query_index_sort = PhysicalSortExpr {
+            expr: expressions::col(QUERY_INDEX_COL, unioned.schema().as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        };
+        let distance_sort = PhysicalSortExpr {
+            expr: expressions::col(DIST_COL, unioned.schema().as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        };
+        let row_id_sort = PhysicalSortExpr {
+            expr: expressions::col(ROW_ID, unioned.schema().as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        };
+
+        Ok(Arc::new(SortExec::new(
+            [query_index_sort, distance_sort, row_id_sort].into(),
+            unioned,
+        )))
+    }
+
+    fn add_query_index_column(
+        plan: Arc<dyn ExecutionPlan>,
+        query_index: u32,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = plan.schema();
+        let mut projection_exprs = Vec::with_capacity(schema.fields().len() + 1);
+        for field in schema.fields() {
+            projection_exprs.push((
+                Arc::new(Column::new_with_schema(field.name(), schema.as_ref())?)
+                    as Arc<dyn PhysicalExpr>,
+                field.name().clone(),
+            ));
+        }
+        projection_exprs.push((
+            Arc::new(Literal::new(ScalarValue::UInt32(Some(query_index)))) as Arc<dyn PhysicalExpr>,
+            QUERY_INDEX_COL.to_string(),
+        ));
+        Ok(Arc::new(ProjectionExec::try_new(projection_exprs, plan)?))
     }
 
     /// Combine ANN results with KNN results for data appended after index creation
@@ -4314,9 +4392,13 @@ impl Scanner {
             input,
             &q.column,
             q.key.clone(),
-            self.nearest_query_count,
-            q.k,
-            metric_type,
+            KnnBatchParams {
+                query_count: self.nearest_query_count,
+                k: q.k,
+                lower_bound: q.lower_bound,
+                upper_bound: q.upper_bound,
+                distance_type: metric_type,
+            },
         )?);
 
         let lower: Option<(Expr, Arc<dyn PhysicalExpr>)> = q
@@ -5042,8 +5124,8 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray, PrimitiveArray,
-        RecordBatchIterator, StringArray, StructArray, UInt8Array,
+        ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray,
+        PrimitiveArray, RecordBatchIterator, StringArray, StructArray, UInt8Array,
     };
 
     use arrow_ord::sort::sort_to_indices;
@@ -5701,6 +5783,7 @@ mod test {
 
         let mut scan = dataset.scan();
         scan.nearest("vec", &queries, 2).unwrap();
+        scan.use_index(false);
         scan.project(&["i"]).unwrap();
 
         let plan = scan.explain_plan(false).await.unwrap();
@@ -5749,6 +5832,105 @@ mod test {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_flat_respects_distance_range() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+
+        let query_values = (32..96).map(|v| v as f32).collect::<Vec<_>>();
+        let queries =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), 32)
+                .unwrap();
+
+        let batch = dataset
+            .scan()
+            .nearest("vec", &queries, 2)
+            .unwrap()
+            .use_index(false)
+            .distance_range(Some(1.0), None)
+            .project(&["i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 4);
+        assert_eq!(
+            batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
+            &[0, 0, 1, 1]
+        );
+
+        for query_index in 0..2 {
+            let query =
+                Float32Array::from(query_values[query_index * 32..(query_index + 1) * 32].to_vec());
+            let single = dataset
+                .scan()
+                .nearest("vec", &query, 2)
+                .unwrap()
+                .use_index(false)
+                .distance_range(Some(1.0), None)
+                .project(&["i"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let query_indices = batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>();
+            let mask = BooleanArray::from_iter(
+                query_indices
+                    .iter()
+                    .map(|value| value.map(|value| value == query_index as u32)),
+            );
+            let batch_slice = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
+            assert_eq!(
+                batch_slice["i"].as_primitive::<Int32Type>().values(),
+                single["i"].as_primitive::<Int32Type>().values()
+            );
+            assert_eq!(
+                batch_slice[DIST_COL].as_primitive::<Float32Type>().values(),
+                single[DIST_COL].as_primitive::<Float32Type>().values()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_uses_index_when_available() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+
+        let query_values = (32..96).map(|v| v as f32).collect::<Vec<_>>();
+        let queries =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), 32)
+                .unwrap();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, 2).unwrap();
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNSubIndex"),
+            "batch KNN should use the vector index when available, got:\n{}",
+            plan
+        );
+        assert!(
+            !plan.contains("KNNVectorDistance: queries=2"),
+            "indexed batch KNN should not force the flat batch path, got:\n{}",
+            plan
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 4);
+        assert_eq!(
+            batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
+            &[0, 0, 1, 1]
+        );
     }
 
     #[rstest]

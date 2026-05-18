@@ -147,6 +147,8 @@ pub struct KNNVectorDistanceExec {
     pub query: ArrayRef,
     pub query_count: usize,
     pub k: usize,
+    pub lower_bound: Option<f32>,
+    pub upper_bound: Option<f32>,
     pub column: String,
     pub distance_type: DistanceType,
 
@@ -157,6 +159,14 @@ pub struct KNNVectorDistanceExec {
     metrics: ExecutionPlanMetricsSet,
 }
 
+pub struct KnnBatchParams {
+    pub query_count: usize,
+    pub k: usize,
+    pub lower_bound: Option<f32>,
+    pub upper_bound: Option<f32>,
+    pub distance_type: DistanceType,
+}
+
 struct BatchKnnConfig {
     input_schema: SchemaRef,
     output_schema: SchemaRef,
@@ -164,6 +174,8 @@ struct BatchKnnConfig {
     query: ArrayRef,
     query_count: usize,
     k: usize,
+    lower_bound: Option<f32>,
+    upper_bound: Option<f32>,
     distance_type: DistanceType,
 }
 
@@ -206,53 +218,33 @@ impl KNNVectorDistanceExec {
         query: ArrayRef,
         distance_type: DistanceType,
     ) -> Result<Self> {
-        Self::try_new_batch(input, column, query, 1, 0, distance_type)
+        Self::try_new_batch(
+            input,
+            column,
+            query,
+            KnnBatchParams {
+                query_count: 1,
+                k: 0,
+                lower_bound: None,
+                upper_bound: None,
+                distance_type,
+            },
+        )
     }
 
-#[derive(Clone)]
-struct BatchKnnCandidate {
-    query_index: u32,
-    distance: f32,
-    row_id: u64,
-    batch: Arc<RecordBatch>,
-    row_index: u32,
-}
-
-impl PartialEq for BatchKnnCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.query_index == other.query_index
-            && self.distance == other.distance
-            && self.row_id == other.row_id
-            && self.row_index == other.row_index
-    }
-}
-
-impl Eq for BatchKnnCandidate {}
-
-impl PartialOrd for BatchKnnCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for BatchKnnCandidate {
-    fn cmp(&self, other: &Self) -> CmpOrdering {
-        self.distance
-            .total_cmp(&other.distance)
-            .then_with(|| self.row_id.cmp(&other.row_id))
-            .then_with(|| self.query_index.cmp(&other.query_index))
-            .then_with(|| self.row_index.cmp(&other.row_index))
-    }
-}
-
-    pub fn try_new_batch(
+    pub(crate) fn try_new_batch(
         input: Arc<dyn ExecutionPlan>,
         column: &str,
         query: ArrayRef,
-        query_count: usize,
-        k: usize,
-        distance_type: DistanceType,
+        params: KnnBatchParams,
     ) -> Result<Self> {
+        let KnnBatchParams {
+            query_count,
+            k,
+            lower_bound,
+            upper_bound,
+            distance_type,
+        } = params;
         if query_count == 0 {
             return Err(Error::invalid_input(
                 "query_count must be positive for KNN".to_string(),
@@ -323,6 +315,8 @@ impl Ord for BatchKnnCandidate {
             query,
             query_count,
             k,
+            lower_bound,
+            upper_bound,
             column: column.to_string(),
             distance_type,
             input_schema,
@@ -343,6 +337,8 @@ impl Ord for BatchKnnCandidate {
             query,
             query_count,
             k,
+            lower_bound,
+            upper_bound,
             distance_type,
         } = config;
         let query_dim = query.len() / query_count;
@@ -383,6 +379,11 @@ impl Ord for BatchKnnCandidate {
                     if !distance.is_finite() {
                         continue;
                     };
+                    if lower_bound.is_some_and(|lower_bound| distance < lower_bound)
+                        || upper_bound.is_some_and(|upper_bound| distance >= upper_bound)
+                    {
+                        continue;
+                    }
                     let candidate = BatchKnnCandidate {
                         query_index: query_index as u32,
                         distance,
@@ -483,9 +484,13 @@ impl ExecutionPlan for KNNVectorDistanceExec {
             children.pop().expect("length checked"),
             &self.column,
             self.query.clone(),
-            self.query_count,
-            self.k,
-            self.distance_type,
+            KnnBatchParams {
+                query_count: self.query_count,
+                k: self.k,
+                lower_bound: self.lower_bound,
+                upper_bound: self.upper_bound,
+                distance_type: self.distance_type,
+            },
         )?))
     }
 
@@ -505,6 +510,8 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                     query: self.query.clone(),
                     query_count: self.query_count,
                     k: self.k,
+                    lower_bound: self.lower_bound,
+                    upper_bound: self.upper_bound,
                     distance_type: self.distance_type,
                 },
             ));
@@ -606,6 +613,42 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         } else {
             vec![Distribution::UnspecifiedDistribution]
         }
+    }
+}
+
+#[derive(Clone)]
+struct BatchKnnCandidate {
+    query_index: u32,
+    distance: f32,
+    row_id: u64,
+    batch: Arc<RecordBatch>,
+    row_index: u32,
+}
+
+impl PartialEq for BatchKnnCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.query_index == other.query_index
+            && self.distance == other.distance
+            && self.row_id == other.row_id
+            && self.row_index == other.row_index
+    }
+}
+
+impl Eq for BatchKnnCandidate {}
+
+impl PartialOrd for BatchKnnCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BatchKnnCandidate {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.distance
+            .total_cmp(&other.distance)
+            .then_with(|| self.row_id.cmp(&other.row_id))
+            .then_with(|| self.query_index.cmp(&other.query_index))
+            .then_with(|| self.row_index.cmp(&other.row_index))
     }
 }
 
