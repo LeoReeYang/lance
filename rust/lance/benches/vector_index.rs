@@ -7,8 +7,8 @@ use std::sync::Arc;
 use arrow_array::{
     FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, cast::as_primitive_array,
 };
-use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema as ArrowSchema};
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
+use criterion::{Criterion, criterion_group, criterion_main};
 use futures::TryStreamExt;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -124,123 +124,6 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
     );
 }
 
-fn bench_batch_flat_knn(c: &mut Criterion) {
-    const DEFAULT_DIM: i32 = 512;
-    const K: usize = 10;
-    const DEFAULT_NUM_ROWS: usize = 1_000_000;
-    const DEFAULT_BATCH_SIZE: usize = 10_000;
-    const DEFAULT_QUERY_COUNT: usize = 10;
-
-    let dim = bench_env("LANCE_BATCH_KNN_DIM", DEFAULT_DIM);
-    let num_rows = bench_env("LANCE_BATCH_KNN_ROWS", DEFAULT_NUM_ROWS);
-    let batch_size = bench_env("LANCE_BATCH_KNN_BATCH_SIZE", DEFAULT_BATCH_SIZE);
-    let query_count = bench_env("LANCE_BATCH_KNN_QUERY_COUNT", DEFAULT_QUERY_COUNT);
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let uri = std::env::temp_dir()
-        .join(format!(
-            "batch_flat_vec_data_{}.lance",
-            rand::random::<u64>()
-        ))
-        .to_string_lossy()
-        .to_string();
-    let dataset = rt.block_on(async {
-        create_flat_file(&uri, WriteMode::Create, num_rows, batch_size, dim).await
-    });
-    let first_batch = rt.block_on(async {
-        dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_next()
-            .await
-            .unwrap()
-            .unwrap()
-    });
-    let vector_column = first_batch.column_by_name("vector").unwrap();
-    let vectors = as_fixed_size_list_array(vector_column);
-    let query_values = (0..query_count)
-        .flat_map(|query_index| {
-            let values = vectors.value(query_index);
-            as_primitive_array::<arrow_array::types::Float32Type>(&values)
-                .values()
-                .to_vec()
-        })
-        .collect::<Vec<_>>();
-    let queries =
-        FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), dim)
-            .unwrap();
-
-    let mut group = c.benchmark_group("batch_flat_knn");
-    group.bench_function(
-        BenchmarkId::new(
-            "separate_queries",
-            format!("rows={num_rows},dim={dim},queries={query_count}"),
-        ),
-        |b| {
-            b.to_async(&rt).iter(|| async {
-                for query_index in 0..query_count {
-                    let query = Float32Array::from(
-                        query_values[query_index * dim as usize..(query_index + 1) * dim as usize]
-                            .to_vec(),
-                    );
-                    let results = dataset
-                        .scan()
-                        .nearest("vector", &query, K)
-                        .unwrap()
-                        .use_index(false)
-                        .project::<&str>(&[])
-                        .unwrap()
-                        .try_into_stream()
-                        .await
-                        .unwrap()
-                        .try_collect::<Vec<_>>()
-                        .await
-                        .unwrap();
-                    assert!(!results.is_empty());
-                }
-            })
-        },
-    );
-    group.bench_function(
-        BenchmarkId::new(
-            "batch_query",
-            format!("rows={num_rows},dim={dim},queries={query_count}"),
-        ),
-        |b| {
-            b.to_async(&rt).iter(|| async {
-                let results = dataset
-                    .scan()
-                    .nearest("vector", &queries, K)
-                    .unwrap()
-                    .project::<&str>(&[])
-                    .unwrap()
-                    .try_into_stream()
-                    .await
-                    .unwrap()
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .unwrap();
-                assert!(!results.is_empty());
-            })
-        },
-    );
-    group.finish();
-    drop(dataset);
-    let _ = std::fs::remove_dir_all(uri);
-}
-
-fn bench_env<T>(key: &str, default: T) -> T
-where
-    T: std::str::FromStr,
-{
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
 async fn create_file(path: &std::path::Path, mode: WriteMode) {
     let schema = Arc::new(ArrowSchema::new(vec![Field::new(
         "vector",
@@ -272,8 +155,8 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     let test_uri = path.to_str().unwrap();
     std::fs::remove_dir_all(test_uri).map_or_else(|_| println!("{} not exists", test_uri), |_| {});
     let write_params = WriteParams {
-        max_rows_per_file: num_rows,
-        max_rows_per_group: batch_size,
+        max_rows_per_file: num_rows as usize,
+        max_rows_per_group: batch_size as usize,
         mode,
         ..Default::default()
     };
@@ -304,75 +187,10 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
         .unwrap();
 }
 
-async fn create_flat_file(
-    uri: &str,
-    mode: WriteMode,
-    num_rows: usize,
-    batch_size: usize,
-    dim: i32,
-) -> Dataset {
-    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-        "vector",
-        DataType::FixedSizeList(
-            FieldRef::new(Field::new("item", DataType::Float32, true)),
-            dim,
-        ),
-        false,
-    )]));
-
-    struct FlatVectorBatchIter {
-        schema: Arc<ArrowSchema>,
-        remaining_rows: usize,
-        batch_size: usize,
-        dim: i32,
-    }
-
-    impl Iterator for FlatVectorBatchIter {
-        type Item = Result<RecordBatch, ArrowError>;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            if self.remaining_rows == 0 {
-                return None;
-            }
-            let rows = self.remaining_rows.min(self.batch_size);
-            self.remaining_rows -= rows;
-
-            let values = create_float32_array(rows * self.dim as usize);
-            Some(RecordBatch::try_new(
-                self.schema.clone(),
-                vec![Arc::new(
-                    FixedSizeListArray::try_new_from_values(values, self.dim).unwrap(),
-                )],
-            ))
-        }
-    }
-
-    std::fs::remove_dir_all(uri).map_or_else(|_| println!("{} not exists", uri), |_| {});
-    let write_params = WriteParams {
-        max_rows_per_file: num_rows,
-        max_rows_per_group: batch_size,
-        mode,
-        ..Default::default()
-    };
-    let reader = RecordBatchIterator::new(
-        FlatVectorBatchIter {
-            schema: schema.clone(),
-            remaining_rows: num_rows,
-            batch_size,
-            dim,
-        },
-        schema,
-    );
-    Dataset::write(reader, uri, Some(write_params))
-        .await
-        .unwrap()
-}
-
-fn create_float32_array(num_elements: usize) -> Float32Array {
-    // Generate random values on demand so large benchmark datasets do not need
-    // to be fully materialized in memory before writing.
+fn create_float32_array(num_elements: i32) -> Float32Array {
+    // generate an Arrow Float32Array with 10000*128 elements randomly
     let mut rng = rand::rng();
-    let mut values = Vec::with_capacity(num_elements);
+    let mut values = Vec::with_capacity(num_elements as usize);
     for _ in 0..num_elements {
         values.push(rng.random_range(0.0..1.0));
     }
@@ -384,12 +202,12 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_ivf_pq_index, bench_batch_flat_knn);
+    targets = bench_ivf_pq_index);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_ivf_pq_index, bench_batch_flat_knn);
+    targets = bench_ivf_pq_index);
 criterion_main!(benches);

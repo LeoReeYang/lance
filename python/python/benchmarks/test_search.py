@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import os
 import shutil
 from pathlib import Path
 from typing import NamedTuple, Union
@@ -13,6 +14,11 @@ import pytest
 N_DIMS = 768
 NUM_ROWS = 100_000
 NEW_ROWS = 10_000
+BATCH_FLAT_KNN_DIM = 512
+BATCH_FLAT_KNN_K = 10
+BATCH_FLAT_KNN_BATCH_SIZE = 10_000
+BATCH_FLAT_KNN_QUERY_COUNT = 10
+BATCH_FLAT_KNN_ROWS = 1_000_000
 
 
 def find_or_clean(dataset_path: Path) -> Union[lance.LanceDataset, None]:
@@ -62,6 +68,49 @@ def create_table(num_rows, offset) -> pa.Table:
             "genres": genres,
         }
     )
+
+
+def get_benchmark_env(key: str, default: int) -> int:
+    value = os.environ.get(key)
+    if value is None:
+        return default
+    return int(value)
+
+
+def create_flat_vector_table(num_rows: int, offset: int, dim: int) -> pa.Table:
+    rng = np.random.default_rng(seed=offset)
+    values = rng.random((num_rows, dim), dtype=np.float32)
+    vectors = pa.FixedSizeListArray.from_arrays(pa.array(values.ravel()), dim)
+    ids = pa.array(range(offset, offset + num_rows))
+    return pa.table({"vector": vectors, "id": ids})
+
+
+def create_batch_flat_knn_dataset(
+    data_dir: Path, num_rows: int, batch_size: int, dim: int
+) -> lance.LanceDataset:
+    tmp_path = data_dir / f"batch_flat_knn_{num_rows}_{batch_size}_{dim}"
+    dataset = find_or_clean(tmp_path)
+    if dataset:
+        return dataset
+
+    rows_remaining = num_rows
+    offset = 0
+    dataset = None
+    while rows_remaining > 0:
+        next_batch_length = min(rows_remaining, batch_size)
+        rows_remaining -= next_batch_length
+        table = create_flat_vector_table(next_batch_length, offset, dim)
+        if offset == 0:
+            dataset = lance.write_dataset(
+                table, tmp_path, data_storage_version="stable"
+            )
+        else:
+            dataset = lance.write_dataset(
+                table, tmp_path, mode="append", data_storage_version="stable"
+            )
+        offset += next_batch_length
+
+    return dataset
 
 
 def create_base_dataset(data_dir: Path) -> lance.LanceDataset:
@@ -171,6 +220,57 @@ def test_knn_search(test_dataset, benchmark):
         ),
     )
     assert result.num_rows > 0
+
+
+@pytest.mark.benchmark(group="batch_flat_knn")
+@pytest.mark.parametrize("mode", ["separate", "batch"])
+def test_batch_flat_knn(data_dir: Path, benchmark, mode: str):
+    dim = get_benchmark_env("LANCE_BATCH_KNN_DIM", BATCH_FLAT_KNN_DIM)
+    num_rows = get_benchmark_env("LANCE_BATCH_KNN_ROWS", BATCH_FLAT_KNN_ROWS)
+    batch_size = get_benchmark_env(
+        "LANCE_BATCH_KNN_BATCH_SIZE", BATCH_FLAT_KNN_BATCH_SIZE
+    )
+    query_count = get_benchmark_env(
+        "LANCE_BATCH_KNN_QUERY_COUNT", BATCH_FLAT_KNN_QUERY_COUNT
+    )
+    rounds = get_benchmark_env("LANCE_BATCH_KNN_ROUNDS", 10)
+    dataset = create_batch_flat_knn_dataset(data_dir, num_rows, batch_size, dim)
+    query_table = dataset.to_table(columns=["vector"], limit=query_count)
+    query_values = np.asarray(
+        query_table["vector"].combine_chunks().values, dtype=np.float32
+    ).reshape(query_count, dim)
+
+    def separate_queries():
+        total_rows = 0
+        for query in query_values:
+            total_rows += dataset.to_table(
+                columns=[],
+                nearest={
+                    "column": "vector",
+                    "q": query,
+                    "k": BATCH_FLAT_KNN_K,
+                    "use_index": False,
+                },
+            ).num_rows
+        return total_rows
+
+    def batch_query():
+        return dataset.to_table(
+            columns=[],
+            nearest={
+                "column": "vector",
+                "q": query_values,
+                "k": BATCH_FLAT_KNN_K,
+                "use_index": False,
+            },
+        ).num_rows
+
+    if mode == "separate":
+        result = benchmark.pedantic(separate_queries, rounds=rounds, iterations=1)
+    else:
+        result = benchmark.pedantic(batch_query, rounds=rounds, iterations=1)
+
+    assert result == query_count * BATCH_FLAT_KNN_K
 
 
 @pytest.mark.benchmark(group="query_ann")

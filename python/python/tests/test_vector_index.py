@@ -194,8 +194,8 @@ def test_batch_flat_query_matches_repeated_single_queries(dataset):
     )
 
     assert batch.num_rows == queries.shape[0] * k
-    assert batch.column_names == ["id", "_distance", "_query_index"]
-    assert batch["_query_index"].to_pylist() == [0] * k + [1] * k
+    assert batch.column_names == ["id", "_distance", "query_index"]
+    assert batch["query_index"].to_pylist() == [0] * k + [1] * k
 
     for query_index, query in enumerate(queries):
         single = dataset.to_table(
@@ -207,7 +207,7 @@ def test_batch_flat_query_matches_repeated_single_queries(dataset):
                 "use_index": False,
             },
         )
-        batch_slice = batch.filter(pc.field("_query_index") == query_index)
+        batch_slice = batch.filter(pc.field("query_index") == query_index)
         assert batch_slice["id"].to_pylist() == single["id"].to_pylist()
         np.testing.assert_allclose(
             batch_slice["_distance"].to_numpy(),

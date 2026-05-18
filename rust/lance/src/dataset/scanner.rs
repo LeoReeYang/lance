@@ -1466,6 +1466,9 @@ impl Scanner {
                             )));
                         }
                     }
+                    // A list-like query against a multivector column is one multivector query.
+                    // The same list-like query against a fixed-size vector column is a batch
+                    // of single-vector queries.
                     let query_count = if matches!(vector_type, DataType::List(_)) {
                         1
                     } else {
@@ -1482,6 +1485,9 @@ impl Scanner {
                             dim,
                         )));
                     }
+                    // A list-like query against a multivector column is one multivector query.
+                    // The same list-like query against a fixed-size vector column is a batch
+                    // of single-vector queries.
                     let query_count = if matches!(vector_type, DataType::List(_)) {
                         1
                     } else {

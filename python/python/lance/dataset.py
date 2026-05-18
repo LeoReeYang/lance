@@ -1101,7 +1101,7 @@ class LanceDataset(pa.dataset.Dataset):
 
             ``q`` may also be a 2-D array-like value for fixed-size vector columns.
             In that case Lance runs a flat batch KNN query, returns up to ``k`` rows
-            for each query vector, and adds ``_query_index`` to identify the source
+            for each query vector, and adds ``query_index`` to identify the source
             query for each result row. Indexed/ANN batch search is not used in this
             first implementation.
 
@@ -5998,7 +5998,7 @@ class ScannerBuilder:
         q: QueryVectorLike
             A single query vector or, for fixed-size vector columns, a 2-D array-like
             batch of query vectors. Batch queries return up to ``k`` rows per query
-            and include ``_query_index`` in the output.
+            and include ``query_index`` in the output.
         query_parallelism: int, optional
             Maximum partition-search concurrency for a single vector query.
             The default is 0. Value 0 uses the automatic policy, which
@@ -7149,7 +7149,7 @@ def _build_vector_search_query(
     q: QueryVectorLike
         The query vector. For fixed-size vector columns, this may be a 2-D
         array-like batch of query vectors. Batch queries run flat KNN, apply
-        ``k`` per query vector, and add ``_query_index`` to the result so
+        ``k`` per query vector, and add ``query_index`` to the result so
         callers can split rows by input query.
     k: int, optional
         The number of nearest neighbors to return.

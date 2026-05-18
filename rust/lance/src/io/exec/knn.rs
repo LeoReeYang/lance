@@ -71,7 +71,7 @@ use super::utils::{
     SelectionVectorToPrefilter,
 };
 
-pub const QUERY_INDEX_COL: &str = "_query_index";
+pub const QUERY_INDEX_COL: &str = "query_index";
 
 pub struct AnnPartitionMetrics {
     index_metrics: IndexMetrics,
@@ -347,10 +347,9 @@ impl Ord for BatchKnnCandidate {
         } = config;
         let query_dim = query.len() / query_count;
         let mut heaps = (0..query_count)
-            .map(|_| BinaryHeap::<BatchKnnCandidate>::with_capacity(k + 1))
+            .map(|_| BinaryHeap::<BatchKnnCandidate>::with_capacity(k))
             .collect::<Vec<_>>();
         let mut input = input;
-        let mut fallback_row_id = 0_u64;
 
         while let Some(batch) = input.next().await {
             let batch = batch?;
@@ -360,7 +359,13 @@ impl Ord for BatchKnnCandidate {
 
             let row_ids = batch
                 .column_by_name(ROW_ID)
-                .map(|row_ids| row_ids.as_primitive::<UInt64Type>().clone());
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "KNNVectorDistanceExec batch mode requires _rowid in input".to_string(),
+                    )
+                })?
+                .as_primitive::<UInt64Type>()
+                .clone();
             let batch = Arc::new(batch);
 
             for (query_index, heap) in heaps.iter_mut().enumerate().take(query_count) {
@@ -378,14 +383,10 @@ impl Ord for BatchKnnCandidate {
                     if !distance.is_finite() {
                         continue;
                     };
-                    let row_id = row_ids
-                        .as_ref()
-                        .map(|row_ids| row_ids.value(row_index))
-                        .unwrap_or(fallback_row_id + row_index as u64);
                     let candidate = BatchKnnCandidate {
                         query_index: query_index as u32,
                         distance,
-                        row_id,
+                        row_id: row_ids.value(row_index),
                         batch: batch.clone(),
                         row_index: row_index as u32,
                     };
@@ -400,8 +401,6 @@ impl Ord for BatchKnnCandidate {
                     }
                 }
             }
-
-            fallback_row_id += batch.num_rows() as u64;
         }
 
         let mut results = heaps
