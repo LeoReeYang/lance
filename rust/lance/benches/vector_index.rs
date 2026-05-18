@@ -3,7 +3,6 @@
 #![allow(clippy::print_stdout)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow_array::{
     FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, cast::as_primitive_array,
@@ -15,7 +14,7 @@ use futures::TryStreamExt;
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
 
-use lance::dataset::{Dataset, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder};
+use lance::dataset::{Dataset, WriteMode, WriteParams, builder::DatasetBuilder};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance_arrow::{FixedSizeListArrayExt, as_fixed_size_list_array};
@@ -23,23 +22,7 @@ use lance_index::{
     IndexType,
     vector::{ivf::IvfBuildParams, pq::PQBuildParams},
 };
-use lance_io::object_store::{ObjectStoreParams, WrappingObjectStore};
 use lance_linalg::distance::MetricType;
-use object_store::{
-    ObjectStore,
-    throttle::{ThrottleConfig, ThrottledStore},
-};
-
-#[derive(Debug)]
-struct ThrottledStoreWrapper {
-    config: ThrottleConfig,
-}
-
-impl WrappingObjectStore for ThrottledStoreWrapper {
-    fn wrap(&self, _prefix: &str, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
-        Arc::new(ThrottledStore::new(original, self.config.clone()))
-    }
-}
 
 fn bench_ivf_pq_index(c: &mut Criterion) {
     // default tokio runtime
@@ -147,18 +130,15 @@ fn bench_batch_flat_knn(c: &mut Criterion) {
     const QUERY_COUNT: usize = 8;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let uri = format!("memory://batch_flat_vec_data_{}", rand::random::<u64>());
-    let dataset = rt.block_on(async {
-        create_flat_file(
-            &uri,
-            WriteMode::Create,
-            50_000,
-            5_000,
-            DIM,
-            Duration::from_millis(5),
-        )
-        .await
-    });
+    let uri = std::env::temp_dir()
+        .join(format!(
+            "batch_flat_vec_data_{}.lance",
+            rand::random::<u64>()
+        ))
+        .to_string_lossy()
+        .to_string();
+    let dataset =
+        rt.block_on(async { create_flat_file(&uri, WriteMode::Create, 50_000, 5_000, DIM).await });
     let first_batch = rt.block_on(async {
         dataset
             .scan()
@@ -213,7 +193,7 @@ fn bench_batch_flat_knn(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             let results = dataset
                 .scan()
-                .nearest_batch("vector", &queries, K)
+                .nearest("vector", &queries, K)
                 .unwrap()
                 .project::<&str>(&[])
                 .unwrap()
@@ -298,7 +278,6 @@ async fn create_flat_file(
     num_rows: i32,
     batch_size: i32,
     dim: i32,
-    wait_get_per_call: Duration,
 ) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![Field::new(
         "vector",
@@ -325,45 +304,17 @@ async fn create_flat_file(
         })
         .collect();
 
-    if !uri.starts_with("memory://") {
-        std::fs::remove_dir_all(uri).map_or_else(|_| println!("{} not exists", uri), |_| {});
-    }
-    let store_params = if wait_get_per_call.is_zero() {
-        None
-    } else {
-        Some(ObjectStoreParams {
-            object_store_wrapper: Some(Arc::new(ThrottledStoreWrapper {
-                config: ThrottleConfig {
-                    wait_get_per_call,
-                    ..Default::default()
-                },
-            })),
-            ..Default::default()
-        })
-    };
+    std::fs::remove_dir_all(uri).map_or_else(|_| println!("{} not exists", uri), |_| {});
     let write_params = WriteParams {
         max_rows_per_file: num_rows as usize,
         max_rows_per_group: batch_size as usize,
-        store_params: store_params.clone(),
         mode,
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-    let dataset = Dataset::write(reader, uri, Some(write_params))
+    Dataset::write(reader, uri, Some(write_params))
         .await
-        .unwrap();
-    if uri.starts_with("memory://") {
-        dataset
-    } else {
-        DatasetBuilder::from_uri(uri)
-            .with_read_params(ReadParams {
-                store_options: store_params,
-                ..Default::default()
-            })
-            .load()
-            .await
-            .unwrap()
-    }
+        .unwrap()
 }
 
 fn create_float32_array(num_elements: i32) -> Float32Array {

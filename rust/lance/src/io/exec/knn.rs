@@ -145,23 +145,52 @@ pub struct KNNVectorDistanceExec {
 
     /// The vector query to execute.
     pub query: ArrayRef,
+    pub query_count: usize,
+    pub k: usize,
     pub column: String,
     pub distance_type: DistanceType,
 
+    input_schema: SchemaRef,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
 
     metrics: ExecutionPlanMetricsSet,
 }
 
+struct BatchKnnConfig {
+    input_schema: SchemaRef,
+    output_schema: SchemaRef,
+    column: String,
+    query: ArrayRef,
+    query_count: usize,
+    k: usize,
+    distance_type: DistanceType,
+}
+
 impl DisplayAs for KNNVectorDistanceExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "KNNVectorDistance: metric={}", self.distance_type,)
+                if self.query_count > 1 {
+                    write!(
+                        f,
+                        "KNNVectorDistance: queries={}, k={}, metric={}",
+                        self.query_count, self.k, self.distance_type,
+                    )
+                } else {
+                    write!(f, "KNNVectorDistance: metric={}", self.distance_type,)
+                }
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "KNNVectorDistance\nmetric={}", self.distance_type,)
+                if self.query_count > 1 {
+                    write!(
+                        f,
+                        "KNNVectorDistance\nqueries={}\nk={}\nmetric={}",
+                        self.query_count, self.k, self.distance_type,
+                    )
+                } else {
+                    write!(f, "KNNVectorDistance\nmetric={}", self.distance_type,)
+                }
             }
         }
     }
@@ -177,180 +206,8 @@ impl KNNVectorDistanceExec {
         query: ArrayRef,
         distance_type: DistanceType,
     ) -> Result<Self> {
-        let mut output_schema = input.schema().as_ref().clone();
-        let (_, element_type) = get_vector_type(&(&output_schema).try_into()?, column)?;
-        validate_distance_type_for(distance_type, &element_type)?;
-
-        // FlatExec appends a distance column to the input schema. The input
-        // may already have a distance column (possibly in the wrong position), so
-        // we need to remove it before adding a new one.
-        if output_schema.column_with_name(DIST_COL).is_some() {
-            output_schema = output_schema.without_column(DIST_COL);
-        }
-        let output_schema = Arc::new(output_schema.try_with_column(Field::new(
-            DIST_COL,
-            DataType::Float32,
-            true,
-        ))?);
-
-        // This node has the same partitioning & boundedness as the input node
-        // but it destroys any ordering.
-        let properties = Arc::new(
-            input
-                .properties()
-                .as_ref()
-                .clone()
-                .with_eq_properties(EquivalenceProperties::new(output_schema.clone())),
-        );
-
-        Ok(Self {
-            input,
-            query,
-            column: column.to_string(),
-            distance_type,
-            output_schema,
-            properties,
-            metrics: ExecutionPlanMetricsSet::new(),
-        })
+        Self::try_new_batch(input, column, query, 1, 0, distance_type)
     }
-}
-
-impl ExecutionPlan for KNNVectorDistanceExec {
-    fn name(&self) -> &str {
-        "KNNVectorDistanceExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    /// Flat KNN inherits the schema from input node, and add one distance column.
-    fn schema(&self) -> arrow_schema::SchemaRef {
-        self.output_schema.clone()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Internal(
-                "KNNVectorDistanceExec node must have exactly one child".to_string(),
-            ));
-        }
-
-        Ok(Arc::new(Self::try_new(
-            children.pop().expect("length checked"),
-            &self.column,
-            self.query.clone(),
-            self.distance_type,
-        )?))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<datafusion::execution::context::TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        let input_stream = self.input.execute(partition, context)?;
-        let input_schema = input_stream.schema();
-        let key = self.query.clone();
-        let column = self.column.clone();
-        let dt = self.distance_type;
-        let schema = self.schema();
-
-        // Empty batches don't have a vector column to score; filter them out
-        // before reaching the helper so the transform always sees real work.
-        let filtered_input = Box::pin(RecordBatchStreamAdapter::new(
-            input_schema,
-            input_stream.try_filter(|batch| future::ready(batch.num_rows() > 0)),
-        )) as SendableRecordBatchStream;
-
-        // Mirror of the helper's elapsed_compute counter; used to attribute
-        // wall-clock from the spawn_blocking distance kernel back onto the
-        // node's `elapsed_compute` metric.
-        let elapsed_compute = BaselineMetrics::new(&self.metrics, partition)
-            .elapsed_compute()
-            .clone();
-
-        let stream = InstrumentedChildInputStream::new(
-            filtered_input,
-            schema,
-            move |batch| {
-                let key = key.clone();
-                let column = column.clone();
-                let elapsed_compute = elapsed_compute.clone();
-                async move {
-                    // Time around the .await to capture the spawn_blocking
-                    // distance work, which otherwise runs while this future is
-                    // Pending and is missed by the helper's own poll timer.
-                    let start = std::time::Instant::now();
-                    let batch = compute_distance(key, dt, &column, batch)
-                        .await
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    elapsed_compute.add_duration(start.elapsed());
-
-                    let distances = batch[DIST_COL].as_primitive::<Float32Type>();
-                    let mask = BooleanArray::from_iter(
-                        distances
-                            .iter()
-                            .map(|v| Some(v.map(|v| !v.is_nan()).unwrap_or(false))),
-                    );
-                    arrow::compute::filter_record_batch(&batch, &mask)
-                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-                }
-            },
-            get_num_compute_intensive_cpus(),
-            partition,
-            &self.metrics,
-        );
-        Ok(Box::pin(stream) as SendableRecordBatchStream)
-    }
-
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
-        let inner_stats = self.input.partition_statistics(partition)?;
-        let schema = self.input.schema();
-        let dist_stats = inner_stats
-            .column_statistics
-            .iter()
-            .zip(schema.fields())
-            .find(|(_, field)| field.name() == &self.column)
-            .map(|(stats, _)| ColumnStatistics {
-                null_count: stats.null_count,
-                ..Default::default()
-            })
-            .unwrap_or_default();
-        let column_statistics = inner_stats
-            .column_statistics
-            .into_iter()
-            .zip(schema.fields())
-            .filter(|(_, field)| field.name() != DIST_COL)
-            .map(|(stats, _)| stats)
-            .chain(std::iter::once(dist_stats))
-            .collect::<Vec<_>>();
-        Ok(Statistics {
-            num_rows: inner_stats.num_rows,
-            column_statistics,
-            ..Statistics::new_unknown(self.schema().as_ref())
-        })
-    }
-
-    fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.metrics.clone_inner())
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn supports_limit_pushdown(&self) -> bool {
-        false
-    }
-}
 
 #[derive(Clone)]
 struct BatchKnnCandidate {
@@ -388,44 +245,7 @@ impl Ord for BatchKnnCandidate {
     }
 }
 
-/// [ExecutionPlan] that computes flat KNN for a batch of query vectors.
-///
-/// This node consumes the input once, computes distances from each input vector
-/// to each query vector, and keeps the top-k rows independently for every query.
-#[derive(Debug)]
-pub struct KNNBatchVectorDistanceExec {
-    pub input: Arc<dyn ExecutionPlan>,
-    pub query: ArrayRef,
-    pub query_count: usize,
-    pub k: usize,
-    pub column: String,
-    pub distance_type: DistanceType,
-
-    input_schema: SchemaRef,
-    output_schema: SchemaRef,
-    properties: Arc<PlanProperties>,
-    metrics: ExecutionPlanMetricsSet,
-}
-
-impl DisplayAs for KNNBatchVectorDistanceExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
-                f,
-                "KNNBatchVectorDistance: queries={}, k={}, metric={}",
-                self.query_count, self.k, self.distance_type
-            ),
-            DisplayFormatType::TreeRender => write!(
-                f,
-                "KNNBatchVectorDistance\nqueries={}\nk={}\nmetric={}",
-                self.query_count, self.k, self.distance_type
-            ),
-        }
-    }
-}
-
-impl KNNBatchVectorDistanceExec {
-    pub fn try_new(
+    pub fn try_new_batch(
         input: Arc<dyn ExecutionPlan>,
         column: &str,
         query: ArrayRef,
@@ -435,26 +255,29 @@ impl KNNBatchVectorDistanceExec {
     ) -> Result<Self> {
         if query_count == 0 {
             return Err(Error::invalid_input(
-                "query_count must be positive for batch KNN".to_string(),
+                "query_count must be positive for KNN".to_string(),
             ));
         }
-        if k == 0 {
-            return Err(Error::invalid_input(
-                "k must be positive for batch KNN".to_string(),
-            ));
-        }
-        if query.len() % query_count != 0 {
+        if !query.len().is_multiple_of(query_count) {
             return Err(Error::invalid_input(format!(
                 "query length ({}) must be divisible by query_count ({})",
                 query.len(),
                 query_count
             )));
         }
+        if query_count > 1 && k == 0 {
+            return Err(Error::invalid_input(
+                "k must be positive for batch KNN".to_string(),
+            ));
+        }
 
         let mut input_schema = input.schema().as_ref().clone();
         let (_, element_type) = get_vector_type(&(&input_schema).try_into()?, column)?;
         validate_distance_type_for(distance_type, &element_type)?;
 
+        // FlatExec appends a distance column to the input schema. The input
+        // may already have a distance column (possibly in the wrong position), so
+        // we need to remove it before adding a new one.
         if input_schema.column_with_name(DIST_COL).is_some() {
             input_schema = input_schema.without_column(DIST_COL);
         }
@@ -462,20 +285,38 @@ impl KNNBatchVectorDistanceExec {
             input_schema = input_schema.without_column(QUERY_INDEX_COL);
         }
         let input_schema = Arc::new(input_schema);
-        let output_schema = Arc::new(
-            input_schema
-                .as_ref()
-                .clone()
-                .try_with_column(Field::new(QUERY_INDEX_COL, DataType::UInt32, true))?
-                .try_with_column(Field::new(DIST_COL, DataType::Float32, true))?,
-        );
+        let mut output_schema = input_schema.as_ref().clone();
+        if query_count > 1 {
+            output_schema = output_schema.try_with_column(Field::new(
+                QUERY_INDEX_COL,
+                DataType::UInt32,
+                true,
+            ))?;
+        }
+        let output_schema = Arc::new(output_schema.try_with_column(Field::new(
+            DIST_COL,
+            DataType::Float32,
+            true,
+        ))?);
 
-        let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(output_schema.clone()),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Final,
-            Boundedness::Bounded,
-        ));
+        // This node has the same partitioning & boundedness as the input node
+        // but it destroys any ordering.
+        let properties = if query_count > 1 {
+            Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(output_schema.clone()),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            ))
+        } else {
+            Arc::new(
+                input
+                    .properties()
+                    .as_ref()
+                    .clone()
+                    .with_eq_properties(EquivalenceProperties::new(output_schema.clone())),
+            )
+        };
 
         Ok(Self {
             input,
@@ -493,14 +334,17 @@ impl KNNBatchVectorDistanceExec {
 
     async fn execute_batch(
         input: SendableRecordBatchStream,
-        input_schema: SchemaRef,
-        output_schema: SchemaRef,
-        column: String,
-        query: ArrayRef,
-        query_count: usize,
-        k: usize,
-        distance_type: DistanceType,
+        config: BatchKnnConfig,
     ) -> DataFusionResult<RecordBatch> {
+        let BatchKnnConfig {
+            input_schema,
+            output_schema,
+            column,
+            query,
+            query_count,
+            k,
+            distance_type,
+        } = config;
         let query_dim = query.len() / query_count;
         let mut heaps = (0..query_count)
             .map(|_| BinaryHeap::<BatchKnnCandidate>::with_capacity(k + 1))
@@ -509,17 +353,7 @@ impl KNNBatchVectorDistanceExec {
         let mut fallback_row_id = 0_u64;
 
         while let Some(batch) = input.next().await {
-            let mut batch = batch?;
-            if batch.column_by_name(DIST_COL).is_some() {
-                batch = batch.drop_column(DIST_COL).map_err(|e| {
-                    DataFusionError::ArrowError(Box::new(e), Some("drop _distance".to_string()))
-                })?;
-            }
-            if batch.column_by_name(QUERY_INDEX_COL).is_some() {
-                batch = batch.drop_column(QUERY_INDEX_COL).map_err(|e| {
-                    DataFusionError::ArrowError(Box::new(e), Some("drop _query_index".to_string()))
-                })?;
-            }
+            let batch = batch?;
             if batch.num_rows() == 0 {
                 continue;
             }
@@ -529,14 +363,13 @@ impl KNNBatchVectorDistanceExec {
                 .map(|row_ids| row_ids.as_primitive::<UInt64Type>().clone());
             let batch = Arc::new(batch);
 
-            for query_index in 0..query_count {
+            for (query_index, heap) in heaps.iter_mut().enumerate().take(query_count) {
                 let key = query.slice(query_index * query_dim, query_dim);
                 let with_distances =
                     compute_distance(key, distance_type, &column, batch.as_ref().clone())
                         .await
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 let distances = with_distances[DIST_COL].as_primitive::<Float32Type>();
-                let heap = &mut heaps[query_index];
                 for row_index in 0..batch.num_rows() {
                     if !distances.is_valid(row_index) {
                         continue;
@@ -619,25 +452,22 @@ impl KNNBatchVectorDistanceExec {
     }
 }
 
-impl ExecutionPlan for KNNBatchVectorDistanceExec {
+impl ExecutionPlan for KNNVectorDistanceExec {
     fn name(&self) -> &str {
-        "KNNBatchVectorDistanceExec"
+        "KNNVectorDistanceExec"
     }
 
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
+    /// Flat KNN inherits the schema from input node, and add one distance column.
+    fn schema(&self) -> arrow_schema::SchemaRef {
         self.output_schema.clone()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
-    }
-
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
     }
 
     fn with_new_children(
@@ -646,11 +476,11 @@ impl ExecutionPlan for KNNBatchVectorDistanceExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(
-                "KNNBatchVectorDistanceExec node must have exactly one child".to_string(),
+                "KNNVectorDistanceExec node must have exactly one child".to_string(),
             ));
         }
 
-        Ok(Arc::new(Self::try_new(
+        Ok(Arc::new(Self::try_new_batch(
             children.pop().expect("length checked"),
             &self.column,
             self.query.clone(),
@@ -665,28 +495,96 @@ impl ExecutionPlan for KNNBatchVectorDistanceExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let input = self.input.execute(partition, context)?;
-        let stream = stream::once(Self::execute_batch(
-            input,
-            self.input_schema.clone(),
-            self.output_schema.clone(),
-            self.column.clone(),
-            self.query.clone(),
-            self.query_count,
-            self.k,
-            self.distance_type,
-        ));
+        let input_stream = self.input.execute(partition, context)?;
+        if self.query_count > 1 {
+            let stream = stream::once(Self::execute_batch(
+                input_stream,
+                BatchKnnConfig {
+                    input_schema: self.input_schema.clone(),
+                    output_schema: self.output_schema.clone(),
+                    column: self.column.clone(),
+                    query: self.query.clone(),
+                    query_count: self.query_count,
+                    k: self.k,
+                    distance_type: self.distance_type,
+                },
+            ));
+            let schema = self.schema();
+            return Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
+                schema,
+                stream.boxed(),
+                partition,
+                &self.metrics,
+            )) as SendableRecordBatchStream);
+        }
+        let key = self.query.clone();
+        let column = self.column.clone();
+        let dt = self.distance_type;
+        let stream = input_stream
+            .try_filter(|batch| future::ready(batch.num_rows() > 0))
+            .map(move |batch| {
+                let key = key.clone();
+                let column = column.clone();
+                async move {
+                    let batch = compute_distance(key, dt, &column, batch?)
+                        .await
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                    let distances = batch[DIST_COL].as_primitive::<Float32Type>();
+                    let mask = BooleanArray::from_iter(
+                        distances
+                            .iter()
+                            .map(|v| Some(v.map(|v| !v.is_nan()).unwrap_or(false))),
+                    );
+                    arrow::compute::filter_record_batch(&batch, &mask)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                }
+            })
+            .buffer_unordered(get_num_compute_intensive_cpus());
+        let schema = self.schema();
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
-            self.output_schema.clone(),
+            schema,
             stream.boxed(),
             partition,
             &self.metrics,
-        )))
+        )) as SendableRecordBatchStream)
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+        let inner_stats = self.input.partition_statistics(partition)?;
+        let schema = self.input.schema();
+        let dist_stats = inner_stats
+            .column_statistics
+            .iter()
+            .zip(schema.fields())
+            .find(|(_, field)| field.name() == &self.column)
+            .map(|(stats, _)| ColumnStatistics {
+                null_count: stats.null_count,
+                ..Default::default()
+            })
+            .unwrap_or_default();
+        let column_statistics = inner_stats
+            .column_statistics
+            .into_iter()
+            .zip(schema.fields())
+            .filter(|(_, field)| field.name() != DIST_COL)
+            .map(|(stats, _)| stats)
+            .collect::<Vec<_>>();
+        let column_statistics = if self.query_count > 1 {
+            column_statistics
+                .into_iter()
+                .chain(std::iter::once(ColumnStatistics::default()))
+                .chain(std::iter::once(dist_stats))
+                .collect::<Vec<_>>()
+        } else {
+            column_statistics
+                .into_iter()
+                .chain(std::iter::once(dist_stats))
+                .collect::<Vec<_>>()
+        };
         Ok(Statistics {
-            num_rows: Precision::Inexact(self.query_count * self.k),
+            num_rows: inner_stats.num_rows,
+            column_statistics,
             ..Statistics::new_unknown(self.schema().as_ref())
         })
     }
@@ -701,6 +599,14 @@ impl ExecutionPlan for KNNBatchVectorDistanceExec {
 
     fn supports_limit_pushdown(&self) -> bool {
         false
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        if self.query_count > 1 {
+            vec![Distribution::SinglePartition]
+        } else {
+            vec![Distribution::UnspecifiedDistribution]
+        }
     }
 }
 

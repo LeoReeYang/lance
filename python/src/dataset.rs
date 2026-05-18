@@ -1386,8 +1386,7 @@ impl Dataset {
                     let q = q.as_primitive::<UInt8Type>();
                     scanner.nearest(&column, q, k)
                 }
-                (true, _) => scanner.nearest_batch(&column, &q, k),
-                (false, _) => scanner.nearest(&column, &q, k),
+                (_, _) => scanner.nearest(&column, &q, k),
             };
             let distance_range: Option<(Option<f32>, Option<f32>)> =
                 if let Some(dr) = nearest.get_item("distance_range")? {
