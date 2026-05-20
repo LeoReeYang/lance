@@ -215,6 +215,59 @@ def test_batch_flat_query_matches_repeated_single_queries(dataset):
         )
 
 
+def _assert_batch_matches_single_queries(ds, queries, k, nearest_kwargs):
+    batch = ds.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": queries,
+            "k": k,
+            **nearest_kwargs,
+        },
+    )
+    assert all(
+        nearest_kwargs["distance_range"][0] <= d < nearest_kwargs["distance_range"][1]
+        for d in batch["_distance"].to_pylist()
+    )
+
+    for query_index, query in enumerate(queries):
+        single = ds.to_table(
+            columns=["id"],
+            nearest={
+                "column": "vector",
+                "q": query,
+                "k": k,
+                **nearest_kwargs,
+            },
+        )
+        batch_slice = batch.filter(pc.field("query_index") == query_index)
+        assert batch_slice["id"].to_pylist() == single["id"].to_pylist()
+        np.testing.assert_allclose(
+            batch_slice["_distance"].to_numpy(),
+            single["_distance"].to_numpy(),
+        )
+
+
+def test_batch_flat_respects_distance_range(dataset):
+    queries = np.random.randn(2, 128).astype(np.float32)
+    _assert_batch_matches_single_queries(
+        dataset,
+        queries,
+        k=5,
+        nearest_kwargs={"use_index": False, "distance_range": (0.0, 50.0)},
+    )
+
+
+def test_batch_indexed_respects_distance_range(indexed_dataset):
+    queries = np.random.randn(2, 128).astype(np.float32)
+    _assert_batch_matches_single_queries(
+        indexed_dataset,
+        queries,
+        k=5,
+        nearest_kwargs={"distance_range": (0.0, 50.0)},
+    )
+
+
 def test_ann(indexed_dataset):
     run(indexed_dataset)
 
