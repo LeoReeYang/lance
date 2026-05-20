@@ -268,6 +268,21 @@ def test_batch_indexed_respects_distance_range(indexed_dataset):
     )
 
 
+def test_batch_fast_search_without_index_returns_empty_with_query_index(dataset):
+    queries = np.random.randn(2, 128).astype(np.float32)
+    batch = dataset.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": queries,
+            "k": 5,
+        },
+        fast_search=True,
+    )
+    assert batch.num_rows == 0
+    assert "query_index" in batch.column_names
+
+
 def test_ann(indexed_dataset):
     run(indexed_dataset)
 

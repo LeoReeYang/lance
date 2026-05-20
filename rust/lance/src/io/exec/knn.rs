@@ -652,12 +652,19 @@ impl Ord for BatchKnnCandidate {
     }
 }
 
-pub static KNN_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(Schema::new(vec![
+pub static KNN_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| knn_empty_result_schema(false));
+
+/// Schema for empty vector-search results (e.g. `fast_search` with no index).
+pub fn knn_empty_result_schema(include_query_index: bool) -> SchemaRef {
+    let mut fields = vec![
         Field::new(DIST_COL, DataType::Float32, true),
         ROW_ID_FIELD.clone(),
-    ]))
-});
+    ];
+    if include_query_index {
+        fields.push(Field::new(QUERY_INDEX_COL, DataType::UInt32, true));
+    }
+    Arc::new(Schema::new(fields))
+}
 
 pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![

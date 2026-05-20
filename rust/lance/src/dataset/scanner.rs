@@ -101,7 +101,7 @@ use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
     LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
-    knn::{KNN_INDEX_SCHEMA, KnnBatchParams, QUERY_INDEX_COL, new_knn_exec},
+    knn::{KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema, new_knn_exec},
     project,
 };
 use crate::io::exec::{AddRowOffsetExec, LanceFilterExec, LanceScanConfig, get_physical_optimizer};
@@ -3725,7 +3725,9 @@ impl Scanner {
             Ok(knn_node)
         } else {
             if self.fast_search {
-                return Ok(Arc::new(EmptyExec::new(KNN_INDEX_SCHEMA.clone())));
+                return Ok(Arc::new(EmptyExec::new(knn_empty_result_schema(
+                    self.nearest_query_count > 1,
+                ))));
             }
             // Resolve metric type for flat search (use default if not specified)
             let metric = q
@@ -10103,6 +10105,26 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         assert_eq!(normal_rows, 10);
         assert_eq!(fast_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_batch_fast_search_without_index_returns_empty_with_query_index() {
+        let dataset = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let query_values = (32..96).map(|v| v as f32).collect::<Vec<_>>();
+        let queries =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(query_values), 32).unwrap();
+
+        let mut scanner = dataset.dataset.scan();
+        scanner.nearest("vec", &queries, 2).unwrap().fast_search();
+        let batch = scanner.try_into_batch().await.unwrap();
+
+        assert_eq!(batch.num_rows(), 0);
+        assert!(
+            batch.schema().column_with_name(QUERY_INDEX_COL).is_some(),
+            "batch fast_search without index should still expose query_index in schema"
+        );
     }
 
     #[rstest]
