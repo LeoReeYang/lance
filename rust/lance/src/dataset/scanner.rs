@@ -770,6 +770,9 @@ pub struct Scanner {
 
     nearest: Option<Query>,
     nearest_query_count: usize,
+    /// True when the query shape represents a batch of single-vector queries
+    /// (list-like query on a fixed-size vector column, or multiple concatenated vectors).
+    is_batch_nearest: bool,
 
     /// If false, do not use any scalar indices for the scan
     ///
@@ -1026,6 +1029,7 @@ impl Scanner {
             ordering: None,
             nearest: None,
             nearest_query_count: 1,
+            is_batch_nearest: false,
             use_stats: true,
             ordered: true,
             fragments: None,
@@ -1430,6 +1434,23 @@ impl Scanner {
         Ok(self)
     }
 
+    fn is_batch_nearest_query(
+        vector_type: &DataType,
+        query_type: &DataType,
+        query_len: usize,
+        dim: usize,
+    ) -> bool {
+        match vector_type {
+            DataType::FixedSizeList(_, _) => {
+                matches!(
+                    query_type,
+                    DataType::List(_) | DataType::FixedSizeList(_, _)
+                ) || (query_len > dim && query_len.is_multiple_of(dim))
+            }
+            _ => false,
+        }
+    }
+
     /// Find k-nearest neighbor within the vector column.
     /// the query can be a Float16Array, Float32Array, Float64Array, UInt8Array,
     /// or a ListArray/FixedSizeListArray of the above types.
@@ -1451,8 +1472,10 @@ impl Scanner {
         // make sure the field exists
         let (vector_type, element_type) = get_vector_type(self.dataset.schema(), column)?;
         let dim = get_vector_dim(self.dataset.schema(), column)?;
+        let query_type = q.data_type().clone();
+        let query_len = q.len();
 
-        let (q, query_count) = match q.data_type() {
+        let (q, query_count) = match &query_type {
             DataType::List(_) | DataType::FixedSizeList(_, _) => {
                 if let Some(list_array) = q.as_list_opt::<i32>() {
                     for i in 0..list_array.len() {
@@ -1551,6 +1574,8 @@ impl Scanner {
             dist_q_c: 0.0,
         });
         self.nearest_query_count = query_count;
+        self.is_batch_nearest =
+            Self::is_batch_nearest_query(&vector_type, &query_type, query_len, dim);
         Ok(self)
     }
 
@@ -1881,7 +1906,7 @@ impl Scanner {
 
         if self.nearest.as_ref().is_some() {
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
-            if self.nearest_query_count > 1 {
+            if self.is_batch_nearest {
                 extra_columns.push(ArrowField::new(QUERY_INDEX_COL, DataType::UInt32, true));
             }
         };
@@ -1932,8 +1957,7 @@ impl Scanner {
                 let vector_expr = expressions::col(DIST_COL, current_schema)?;
                 output_expr.push((vector_expr, DIST_COL.to_string()));
             }
-            if self.nearest_query_count > 1
-                && output_expr.iter().all(|(_, name)| name != QUERY_INDEX_COL)
+            if self.is_batch_nearest && output_expr.iter().all(|(_, name)| name != QUERY_INDEX_COL)
             {
                 let query_index_expr = expressions::col(QUERY_INDEX_COL, current_schema)?;
                 output_expr.push((query_index_expr, QUERY_INDEX_COL.to_string()));
@@ -3684,7 +3708,7 @@ impl Scanner {
         };
 
         if let Some((index_name, index_segments, index_metric)) = index_and_segments {
-            if self.nearest_query_count > 1 {
+            if self.is_batch_nearest {
                 return self.batch_indexed_vector_search(filter_plan, &q).await;
             }
 
@@ -3726,7 +3750,7 @@ impl Scanner {
         } else {
             if self.fast_search {
                 return Ok(Arc::new(EmptyExec::new(knn_empty_result_schema(
-                    self.nearest_query_count > 1,
+                    self.is_batch_nearest,
                 ))));
             }
             // Resolve metric type for flat search (use default if not specified)
@@ -3781,6 +3805,7 @@ impl Scanner {
 
             let mut single_scanner = self.clone();
             single_scanner.nearest_query_count = 1;
+            single_scanner.is_batch_nearest = false;
             single_scanner.nearest = Some(single_query.clone());
 
             let single_plan = single_scanner
@@ -4385,7 +4410,7 @@ impl Scanner {
                 default_distance_type_for(&element_type)
             }
         };
-        let input = if self.nearest_query_count > 1 {
+        let input = if self.is_batch_nearest {
             Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
         } else {
             input
@@ -4395,6 +4420,7 @@ impl Scanner {
             &q.column,
             q.key.clone(),
             KnnBatchParams {
+                is_batch: self.is_batch_nearest,
                 query_count: self.nearest_query_count,
                 k: q.k,
                 lower_bound: q.lower_bound,
@@ -4444,7 +4470,7 @@ impl Scanner {
             flat_dist
         };
 
-        if self.nearest_query_count > 1 {
+        if self.is_batch_nearest {
             return Ok(knn_plan);
         }
 
@@ -10105,6 +10131,76 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         assert_eq!(normal_rows, 10);
         assert_eq!(fast_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_batch_single_vector_list_query_includes_query_index() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+
+        let query_values = (32..64).map(|v| v as f32).collect::<Vec<_>>();
+        let queries =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(query_values), 32).unwrap();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, 2).unwrap().use_index(false);
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("KNNVectorDistance: queries=1"),
+            "single-vector batch query should use batch KNN path, got:\n{}",
+            plan
+        );
+        assert!(
+            !plan.contains("SortExec: TopK(fetch="),
+            "batch KNN must not apply per-query SortExec top-k, got:\n{}",
+            plan
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert!(
+            batch.schema().column_with_name(QUERY_INDEX_COL).is_some(),
+            "batch-shaped query with one vector should still return query_index"
+        );
+        assert_eq!(
+            batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
+            &[0, 0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_flat_plan_returns_m_times_k_without_sort_topk() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+
+        let query_values = (32..96).map(|v| v as f32).collect::<Vec<_>>();
+        let queries =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(query_values), 32).unwrap();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, 2).unwrap().use_index(false);
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("KNNVectorDistance: queries=2"),
+            "expected batch flat KNN plan, got:\n{}",
+            plan
+        );
+        assert!(
+            !plan.contains("SortExec: TopK(fetch="),
+            "batch flat KNN must not truncate to k rows globally, got:\n{}",
+            plan
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 4);
     }
 
     #[tokio::test]

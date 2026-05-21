@@ -145,6 +145,7 @@ pub struct KNNVectorDistanceExec {
 
     /// The vector query to execute.
     pub query: ArrayRef,
+    pub is_batch: bool,
     pub query_count: usize,
     pub k: usize,
     pub lower_bound: Option<f32>,
@@ -160,6 +161,7 @@ pub struct KNNVectorDistanceExec {
 }
 
 pub struct KnnBatchParams {
+    pub is_batch: bool,
     pub query_count: usize,
     pub k: usize,
     pub lower_bound: Option<f32>,
@@ -183,7 +185,7 @@ impl DisplayAs for KNNVectorDistanceExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                if self.query_count > 1 {
+                if self.is_batch {
                     write!(
                         f,
                         "KNNVectorDistance: queries={}, k={}, metric={}",
@@ -194,7 +196,7 @@ impl DisplayAs for KNNVectorDistanceExec {
                 }
             }
             DisplayFormatType::TreeRender => {
-                if self.query_count > 1 {
+                if self.is_batch {
                     write!(
                         f,
                         "KNNVectorDistance\nqueries={}\nk={}\nmetric={}",
@@ -223,6 +225,7 @@ impl KNNVectorDistanceExec {
             column,
             query,
             KnnBatchParams {
+                is_batch: false,
                 query_count: 1,
                 k: 0,
                 lower_bound: None,
@@ -239,6 +242,7 @@ impl KNNVectorDistanceExec {
         params: KnnBatchParams,
     ) -> Result<Self> {
         let KnnBatchParams {
+            is_batch,
             query_count,
             k,
             lower_bound,
@@ -257,7 +261,7 @@ impl KNNVectorDistanceExec {
                 query_count
             )));
         }
-        if query_count > 1 && k == 0 {
+        if is_batch && k == 0 {
             return Err(Error::invalid_input(
                 "k must be positive for batch KNN".to_string(),
             ));
@@ -278,7 +282,7 @@ impl KNNVectorDistanceExec {
         }
         let input_schema = Arc::new(input_schema);
         let mut output_schema = input_schema.as_ref().clone();
-        if query_count > 1 {
+        if is_batch {
             output_schema = output_schema.try_with_column(Field::new(
                 QUERY_INDEX_COL,
                 DataType::UInt32,
@@ -293,7 +297,7 @@ impl KNNVectorDistanceExec {
 
         // This node has the same partitioning & boundedness as the input node
         // but it destroys any ordering.
-        let properties = if query_count > 1 {
+        let properties = if is_batch {
             Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(output_schema.clone()),
                 Partitioning::UnknownPartitioning(1),
@@ -313,6 +317,7 @@ impl KNNVectorDistanceExec {
         Ok(Self {
             input,
             query,
+            is_batch,
             query_count,
             k,
             lower_bound,
@@ -485,6 +490,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
             &self.column,
             self.query.clone(),
             KnnBatchParams {
+                is_batch: self.is_batch,
                 query_count: self.query_count,
                 k: self.k,
                 lower_bound: self.lower_bound,
@@ -500,7 +506,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-        if self.query_count > 1 {
+        if self.is_batch {
             let stream = stream::once(Self::execute_batch(
                 input_stream,
                 BatchKnnConfig {
@@ -576,7 +582,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
             .filter(|(_, field)| field.name() != DIST_COL)
             .map(|(stats, _)| stats)
             .collect::<Vec<_>>();
-        let column_statistics = if self.query_count > 1 {
+        let column_statistics = if self.is_batch {
             column_statistics
                 .into_iter()
                 .chain(std::iter::once(ColumnStatistics::default()))
@@ -608,7 +614,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        if self.query_count > 1 {
+        if self.is_batch {
             vec![Distribution::SinglePartition]
         } else {
             vec![Distribution::UnspecifiedDistribution]
