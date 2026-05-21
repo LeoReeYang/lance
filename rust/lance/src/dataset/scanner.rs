@@ -5796,21 +5796,66 @@ mod test {
         assert_eq!(expected_i, actual_i);
     }
 
-    #[tokio::test]
-    async fn test_batch_knn_flat_results_include_query_index() {
-        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
-            .await
-            .unwrap();
-        test_ds.make_vector_index().await.unwrap();
-        let dataset = &test_ds.dataset;
-
+    fn batch_knn_two_queries() -> (FixedSizeListArray, Vec<f32>) {
         let query_values = (32..96).map(|v| v as f32).collect::<Vec<_>>();
         let queries =
             FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), 32)
                 .unwrap();
+        (queries, query_values)
+    }
 
+    async fn assert_batch_matches_single_queries(
+        dataset: &Dataset,
+        batch: &RecordBatch,
+        query_values: &[f32],
+        k: usize,
+        use_index: bool,
+        distance_range: Option<(Option<f32>, Option<f32>)>,
+    ) {
+        let query_count = query_values.len() / 32;
+        assert_eq!(batch.num_rows(), query_count * k);
+
+        for query_index in 0..query_count {
+            let query =
+                Float32Array::from(query_values[query_index * 32..(query_index + 1) * 32].to_vec());
+            let mut scan = dataset.scan();
+            scan.nearest("vec", &query, k).unwrap();
+            scan.use_index(use_index);
+            if let Some((lower, upper)) = distance_range {
+                scan.distance_range(lower, upper);
+            }
+            scan.project(&["i"]).unwrap();
+            let single = scan.try_into_batch().await.unwrap();
+
+            let query_indices = batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>();
+            let mask = BooleanArray::from_iter(
+                query_indices
+                    .iter()
+                    .map(|value| value.map(|value| value == query_index as u32)),
+            );
+            let batch_slice = arrow::compute::filter_record_batch(batch, &mask).unwrap();
+            assert_eq!(
+                batch_slice["i"].as_primitive::<Int32Type>().values(),
+                single["i"].as_primitive::<Int32Type>().values()
+            );
+            assert_eq!(
+                batch_slice[DIST_COL].as_primitive::<Float32Type>().values(),
+                single[DIST_COL].as_primitive::<Float32Type>().values()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_flat() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+        let k = 2;
+
+        let (queries, query_values) = batch_knn_two_queries();
         let mut scan = dataset.scan();
-        scan.nearest("vec", &queries, 2).unwrap();
+        scan.nearest("vec", &queries, k).unwrap();
         scan.use_index(false);
         scan.project(&["i"]).unwrap();
 
@@ -5822,44 +5867,52 @@ mod test {
         );
         assert!(
             !plan.contains("ANNSubIndex"),
-            "batch KNN should not use ANN index yet, got:\n{}",
+            "flat batch KNN should not use ANN index, got:\n{}",
+            plan
+        );
+        assert!(
+            !plan.contains("SortExec: TopK(fetch="),
+            "batch flat KNN must not truncate to k rows globally, got:\n{}",
             plan
         );
 
         let batch = scan.try_into_batch().await.unwrap();
-        assert_eq!(batch.num_rows(), 4);
+        assert_eq!(
+            batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
+            &[0, 0, 1, 1]
+        );
+        assert_batch_matches_single_queries(dataset, &batch, &query_values, k, false, None).await;
 
-        let query_indices = batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>();
-        assert_eq!(query_indices.values(), &[0, 0, 1, 1]);
-
-        let batch_ids = batch["i"].as_primitive::<Int32Type>();
-        let batch_distances = batch[DIST_COL].as_primitive::<Float32Type>();
-
-        for query_index in 0..2 {
-            let query =
-                Float32Array::from(query_values[query_index * 32..(query_index + 1) * 32].to_vec());
-            let single = dataset
-                .scan()
-                .nearest("vec", &query, 2)
-                .unwrap()
-                .use_index(false)
-                .project(&["i"])
-                .unwrap()
-                .try_into_batch()
-                .await
+        let query_values_one = (32..64).map(|v| v as f32).collect::<Vec<_>>();
+        let queries_one =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(query_values_one.clone()), 32)
                 .unwrap();
-            let single_ids = single["i"].as_primitive::<Int32Type>();
-            let single_distances = single[DIST_COL].as_primitive::<Float32Type>();
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries_one, k).unwrap();
+        scan.use_index(false);
+        scan.project(&["i"]).unwrap();
 
-            for result_index in 0..2 {
-                let batch_index = query_index * 2 + result_index;
-                assert_eq!(batch_ids.value(batch_index), single_ids.value(result_index));
-                assert_eq!(
-                    batch_distances.value(batch_index),
-                    single_distances.value(result_index)
-                );
-            }
-        }
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("KNNVectorDistance: queries=1"),
+            "single-vector batch query should use batch KNN path, got:\n{}",
+            plan
+        );
+        assert!(
+            !plan.contains("SortExec: TopK(fetch="),
+            "batch KNN must not apply per-query SortExec top-k, got:\n{}",
+            plan
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert!(
+            batch.schema().column_with_name(QUERY_INDEX_COL).is_some(),
+            "batch-shaped query with one vector should still return query_index"
+        );
+        assert_eq!(
+            batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
+            &[0, 0]
+        );
     }
 
     #[tokio::test]
@@ -5868,11 +5921,7 @@ mod test {
             .await
             .unwrap();
         let dataset = &test_ds.dataset;
-
-        let query_values = (32..96).map(|v| v as f32).collect::<Vec<_>>();
-        let queries =
-            FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), 32)
-                .unwrap();
+        let (queries, query_values) = batch_knn_two_queries();
 
         let batch = dataset
             .scan()
@@ -5886,56 +5935,29 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(batch.num_rows(), 4);
         assert_eq!(
             batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
             &[0, 0, 1, 1]
         );
-
-        for query_index in 0..2 {
-            let query =
-                Float32Array::from(query_values[query_index * 32..(query_index + 1) * 32].to_vec());
-            let single = dataset
-                .scan()
-                .nearest("vec", &query, 2)
-                .unwrap()
-                .use_index(false)
-                .distance_range(Some(1.0), None)
-                .project(&["i"])
-                .unwrap()
-                .try_into_batch()
-                .await
-                .unwrap();
-            let query_indices = batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>();
-            let mask = BooleanArray::from_iter(
-                query_indices
-                    .iter()
-                    .map(|value| value.map(|value| value == query_index as u32)),
-            );
-            let batch_slice = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
-            assert_eq!(
-                batch_slice["i"].as_primitive::<Int32Type>().values(),
-                single["i"].as_primitive::<Int32Type>().values()
-            );
-            assert_eq!(
-                batch_slice[DIST_COL].as_primitive::<Float32Type>().values(),
-                single[DIST_COL].as_primitive::<Float32Type>().values()
-            );
-        }
+        assert_batch_matches_single_queries(
+            dataset,
+            &batch,
+            &query_values,
+            2,
+            false,
+            Some((Some(1.0), None)),
+        )
+        .await;
     }
 
     #[tokio::test]
-    async fn test_batch_knn_uses_index_when_available() {
+    async fn test_batch_knn_indexed() {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
             .await
             .unwrap();
         test_ds.make_vector_index().await.unwrap();
         let dataset = &test_ds.dataset;
-
-        let query_values = (32..96).map(|v| v as f32).collect::<Vec<_>>();
-        let queries =
-            FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), 32)
-                .unwrap();
+        let (queries, query_values) = batch_knn_two_queries();
 
         let mut scan = dataset.scan();
         scan.nearest("vec", &queries, 2).unwrap();
@@ -5954,78 +5976,31 @@ mod test {
         );
 
         let batch = scan.try_into_batch().await.unwrap();
-        assert_eq!(batch.num_rows(), 4);
         assert_eq!(
             batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
             &[0, 0, 1, 1]
         );
-    }
 
-    #[tokio::test]
-    async fn test_batch_knn_indexed_respects_distance_range() {
-        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+        let batch = dataset
+            .scan()
+            .nearest("vec", &queries, 2)
+            .unwrap()
+            .distance_range(Some(1.0), None)
+            .project(&["i"])
+            .unwrap()
+            .try_into_batch()
             .await
             .unwrap();
-        test_ds.make_vector_index().await.unwrap();
-        let dataset = &test_ds.dataset;
-
-        let query_values = (32..96).map(|v| v as f32).collect::<Vec<_>>();
-        let queries =
-            FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), 32)
-                .unwrap();
-
-        let mut scan = dataset.scan();
-        scan.nearest("vec", &queries, 2).unwrap();
-        scan.distance_range(Some(1.0), None);
-        scan.project(&["i"]).unwrap();
-
-        let plan = scan.explain_plan(false).await.unwrap();
-        assert!(
-            plan.contains("ANNSubIndex"),
-            "indexed batch KNN should use the vector index, got:\n{}",
-            plan
-        );
-
-        let batch = scan.try_into_batch().await.unwrap();
-        assert_eq!(batch.num_rows(), 4);
-        assert_eq!(
-            batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
-            &[0, 0, 1, 1]
-        );
-
-        for query_index in 0..2 {
-            let query =
-                Float32Array::from(query_values[query_index * 32..(query_index + 1) * 32].to_vec());
-            let single = dataset
-                .scan()
-                .nearest("vec", &query, 2)
-                .unwrap()
-                .distance_range(Some(1.0), None)
-                .project(&["i"])
-                .unwrap()
-                .try_into_batch()
-                .await
-                .unwrap();
-            let query_indices = batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>();
-            let mask = BooleanArray::from_iter(
-                query_indices
-                    .iter()
-                    .map(|value| value.map(|value| value == query_index as u32)),
-            );
-            let batch_slice = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
-            assert_eq!(
-                batch_slice["i"].as_primitive::<Int32Type>().values(),
-                single["i"].as_primitive::<Int32Type>().values()
-            );
-            assert_eq!(
-                batch_slice[DIST_COL].as_primitive::<Float32Type>().values(),
-                single[DIST_COL].as_primitive::<Float32Type>().values()
-            );
-        }
+        assert_batch_matches_single_queries(
+            dataset,
+            &batch,
+            &query_values,
+            2,
+            true,
+            Some((Some(1.0), None)),
+        )
+        .await;
     }
-
-    #[rstest]
-    #[tokio::test]
     async fn test_can_project_distance() {
         let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
             .await
@@ -10131,76 +10106,6 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         assert_eq!(normal_rows, 10);
         assert_eq!(fast_rows, 0);
-    }
-
-    #[tokio::test]
-    async fn test_batch_single_vector_list_query_includes_query_index() {
-        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
-            .await
-            .unwrap();
-        let dataset = &test_ds.dataset;
-
-        let query_values = (32..64).map(|v| v as f32).collect::<Vec<_>>();
-        let queries =
-            FixedSizeListArray::try_new_from_values(Float32Array::from(query_values), 32).unwrap();
-
-        let mut scan = dataset.scan();
-        scan.nearest("vec", &queries, 2).unwrap().use_index(false);
-        scan.project(&["i"]).unwrap();
-
-        let plan = scan.explain_plan(false).await.unwrap();
-        assert!(
-            plan.contains("KNNVectorDistance: queries=1"),
-            "single-vector batch query should use batch KNN path, got:\n{}",
-            plan
-        );
-        assert!(
-            !plan.contains("SortExec: TopK(fetch="),
-            "batch KNN must not apply per-query SortExec top-k, got:\n{}",
-            plan
-        );
-
-        let batch = scan.try_into_batch().await.unwrap();
-        assert_eq!(batch.num_rows(), 2);
-        assert!(
-            batch.schema().column_with_name(QUERY_INDEX_COL).is_some(),
-            "batch-shaped query with one vector should still return query_index"
-        );
-        assert_eq!(
-            batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
-            &[0, 0]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_batch_flat_plan_returns_m_times_k_without_sort_topk() {
-        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
-            .await
-            .unwrap();
-        let dataset = &test_ds.dataset;
-
-        let query_values = (32..96).map(|v| v as f32).collect::<Vec<_>>();
-        let queries =
-            FixedSizeListArray::try_new_from_values(Float32Array::from(query_values), 32).unwrap();
-
-        let mut scan = dataset.scan();
-        scan.nearest("vec", &queries, 2).unwrap().use_index(false);
-        scan.project(&["i"]).unwrap();
-
-        let plan = scan.explain_plan(false).await.unwrap();
-        assert!(
-            plan.contains("KNNVectorDistance: queries=2"),
-            "expected batch flat KNN plan, got:\n{}",
-            plan
-        );
-        assert!(
-            !plan.contains("SortExec: TopK(fetch="),
-            "batch flat KNN must not truncate to k rows globally, got:\n{}",
-            plan
-        );
-
-        let batch = scan.try_into_batch().await.unwrap();
-        assert_eq!(batch.num_rows(), 4);
     }
 
     #[tokio::test]
