@@ -1957,11 +1957,6 @@ impl Scanner {
                 let vector_expr = expressions::col(DIST_COL, current_schema)?;
                 output_expr.push((vector_expr, DIST_COL.to_string()));
             }
-            if self.is_batch_nearest && output_expr.iter().all(|(_, name)| name != QUERY_INDEX_COL)
-            {
-                let query_index_expr = expressions::col(QUERY_INDEX_COL, current_schema)?;
-                output_expr.push((query_index_expr, QUERY_INDEX_COL.to_string()));
-            }
             if self.full_text_query.is_some()
                 && output_expr.iter().all(|(_, name)| name != SCORE_COL)
             {
@@ -1973,6 +1968,13 @@ impl Scanner {
                 let score_expr = expressions::col(SCORE_COL, current_schema)?;
                 output_expr.push((score_expr, SCORE_COL.to_string()));
             }
+        }
+
+        // Batch nearest queries always expose query_index when the caller requested an
+        // explicit projection but omitted this discriminator column.
+        if self.is_batch_nearest && output_expr.iter().all(|(_, name)| name != QUERY_INDEX_COL) {
+            let query_index_expr = expressions::col(QUERY_INDEX_COL, current_schema)?;
+            output_expr.push((query_index_expr, QUERY_INDEX_COL.to_string()));
         }
 
         if self.legacy_with_row_id {
@@ -5915,6 +5917,47 @@ mod test {
             batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
             &[0, 0]
         );
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_flat_returns_top_k_per_query() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+        let k = 10;
+        let (queries, _) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        scan.use_index(false);
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("SortExec: TopK(fetch="),
+            "batch flat KNN must not apply global SortExec top-k truncation, got:\n{}",
+            plan
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch.num_rows(),
+            2 * k,
+            "batch flat KNN must return k rows per query vector"
+        );
+
+        let query_indices = batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>();
+        for query_index in 0..2 {
+            let rows_for_query = query_indices
+                .iter()
+                .filter(|value| *value == Some(query_index as u32))
+                .count();
+            assert_eq!(
+                rows_for_query, k,
+                "query_index {query_index} should have exactly {k} rows"
+            );
+        }
     }
 
     #[tokio::test]
