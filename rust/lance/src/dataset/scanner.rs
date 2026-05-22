@@ -5884,9 +5884,11 @@ mod test {
         assert_batch_matches_single_queries(dataset, &batch, &query_values, k, false, None).await;
 
         let query_values_one = (32..64).map(|v| v as f32).collect::<Vec<_>>();
-        let queries_one =
-            FixedSizeListArray::try_new_from_values(Float32Array::from(query_values_one.clone()), 32)
-                .unwrap();
+        let queries_one = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(query_values_one.clone()),
+            32,
+        )
+        .unwrap();
         let mut scan = dataset.scan();
         scan.nearest("vec", &queries_one, k).unwrap();
         scan.use_index(false);
@@ -6001,6 +6003,8 @@ mod test {
         )
         .await;
     }
+
+    #[tokio::test]
     async fn test_can_project_distance() {
         let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
             .await
