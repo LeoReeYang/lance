@@ -1099,11 +1099,14 @@ class LanceDataset(pa.dataset.Dataset):
                     "distance_range": (0.0, 1.0),
                 }
 
-            ``q`` may also be a 2-D array-like value for fixed-size vector columns.
-            In that case Lance runs a batch nearest-neighbor query, returns up to
-            ``k`` rows for each query vector, and adds ``query_index`` to identify the
-            source query for each result row. When ``use_index`` is true and a vector
-            index is available, each query vector is searched through the index
+            ``q`` may also be a 2-D array-like value, or a list of vectors, for
+            fixed-size vector columns. In that case Lance runs a batch nearest-neighbor
+            query, returns up to ``k`` rows for each query vector, and adds
+            ``query_index`` to identify the source query for each result row.
+            Flattened 1-D arrays whose length is a multiple of the vector dimension are
+            rejected. Datasets that already contain a ``query_index`` column cannot be
+            used for batch nearest-neighbor search. When ``use_index`` is true and a
+            vector index is available, each query vector is searched through the index
             path; otherwise the flat batch path is used.
 
         batch_size: int, default None
@@ -5998,10 +6001,13 @@ class ScannerBuilder:
         ----------
         q: QueryVectorLike
             A single query vector or, for fixed-size vector columns, a 2-D array-like
-            batch of query vectors. Batch queries return up to ``k`` rows per query
-            and include ``query_index`` in the output. When ``use_index`` is true and
-            a vector index is available, each query vector is searched through the
-            index path; otherwise the flat batch path is used.
+            or list-shaped batch of query vectors. Batch queries return up to ``k`` rows
+            per query and include ``query_index`` in the output. Flattened 1-D inputs
+            whose length is a multiple of the vector dimension are rejected. Datasets
+            with an existing ``query_index`` column cannot be used for batch search.
+            When ``use_index`` is true and a vector index is available, each query
+            vector is searched through the index path; otherwise the flat batch path
+            is used.
         query_parallelism: int, optional
             Maximum partition-search concurrency for a single vector query.
             The default is 0. Value 0 uses the automatic policy, which
@@ -7151,10 +7157,13 @@ def _build_vector_search_query(
         The name of the vector column to search.
     q: QueryVectorLike
         The query vector. For fixed-size vector columns, this may be a 2-D
-        array-like batch of query vectors. Batch queries return up to ``k`` rows per
-        query vector and include ``query_index`` in the output. When ``use_index``
-        is true and a vector index is available, each query vector is searched
-        through the index path; otherwise the flat batch path is used.
+        array-like or list-shaped batch of query vectors. Batch queries return up to
+        ``k`` rows per query vector and include ``query_index`` in the output.
+        Flattened 1-D inputs whose length is a multiple of the vector dimension are
+        rejected. Datasets with an existing ``query_index`` column cannot be used for
+        batch search. When ``use_index`` is true and a vector index is available,
+        each query vector is searched through the index path; otherwise the flat batch
+        path is used.
     k: int, optional
         The number of nearest neighbors to return.
     metric: str, optional

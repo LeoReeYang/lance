@@ -1434,21 +1434,17 @@ impl Scanner {
         Ok(self)
     }
 
-    fn is_batch_nearest_query(
-        vector_type: &DataType,
-        query_type: &DataType,
-        query_len: usize,
-        dim: usize,
-    ) -> bool {
-        match vector_type {
-            DataType::FixedSizeList(_, _) => {
-                matches!(
-                    query_type,
-                    DataType::List(_) | DataType::FixedSizeList(_, _)
-                ) || (query_len > dim && query_len.is_multiple_of(dim))
-            }
-            _ => false,
-        }
+    /// Returns true when `q` is a batch of single-vector queries.
+    ///
+    /// List-like queries against a [`DataType::List`] vector column are treated as one
+    /// multivector query. The same list-like query against a fixed-size vector column is
+    /// treated as a batch of single-vector queries.
+    fn is_batch_nearest_query(vector_type: &DataType, query_type: &DataType) -> bool {
+        matches!(vector_type, DataType::FixedSizeList(_, _))
+            && matches!(
+                query_type,
+                DataType::List(_) | DataType::FixedSizeList(_, _)
+            )
     }
 
     /// Find k-nearest neighbor within the vector column.
@@ -1473,7 +1469,6 @@ impl Scanner {
         let (vector_type, element_type) = get_vector_type(self.dataset.schema(), column)?;
         let dim = get_vector_dim(self.dataset.schema(), column)?;
         let query_type = q.data_type().clone();
-        let query_len = q.len();
 
         let (q, query_count) = match &query_type {
             DataType::List(_) | DataType::FixedSizeList(_, _) => {
@@ -1520,10 +1515,7 @@ impl Scanner {
                 }
             }
             _ => {
-                if q.len() != dim
-                    && (!matches!(vector_type, DataType::FixedSizeList(_, _))
-                        || !q.len().is_multiple_of(dim))
-                {
+                if q.len() != dim {
                     return Err(Error::invalid_input(format!(
                         "query dim({}) doesn't match the column {} vector dim({})",
                         q.len(),
@@ -1531,8 +1523,7 @@ impl Scanner {
                         dim,
                     )));
                 }
-                let query_count = if q.len() == dim { 1 } else { q.len() / dim };
-                (q.slice(0, q.len()), query_count)
+                (q.slice(0, q.len()), 1)
             }
         };
 
@@ -1540,6 +1531,14 @@ impl Scanner {
             return Err(Error::invalid_input(
                 "Query vector must have non-zero length".to_string(),
             ));
+        }
+
+        if Self::is_batch_nearest_query(&vector_type, &query_type)
+            && self.dataset.schema().field(QUERY_INDEX_COL).is_some()
+        {
+            return Err(Error::invalid_input(format!(
+                "batch nearest neighbor search cannot be used on datasets with column '{QUERY_INDEX_COL}'"
+            )));
         }
 
         let key = match &element_type {
@@ -1574,8 +1573,7 @@ impl Scanner {
             dist_q_c: 0.0,
         });
         self.nearest_query_count = query_count;
-        self.is_batch_nearest =
-            Self::is_batch_nearest_query(&vector_type, &query_type, query_len, dim);
+        self.is_batch_nearest = Self::is_batch_nearest_query(&vector_type, &query_type);
         Ok(self)
     }
 
@@ -1970,8 +1968,8 @@ impl Scanner {
             }
         }
 
-        // Batch nearest queries always expose query_index when the caller requested an
-        // explicit projection but omitted this discriminator column.
+        // Batch nearest queries expose the synthetic `query_index` discriminator separately
+        // from scoring-column autoprojection (`_distance` / `_score` above).
         if self.is_batch_nearest && output_expr.iter().all(|(_, name)| name != QUERY_INDEX_COL) {
             let query_index_expr = expressions::col(QUERY_INDEX_COL, current_schema)?;
             output_expr.push((query_index_expr, QUERY_INDEX_COL.to_string()));
@@ -5155,7 +5153,7 @@ mod test {
     use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray,
-        PrimitiveArray, RecordBatchIterator, StringArray, StructArray, UInt8Array,
+        PrimitiveArray, RecordBatchIterator, StringArray, StructArray, UInt8Array, UInt32Array,
     };
 
     use arrow_ord::sort::sort_to_indices;
@@ -5916,6 +5914,121 @@ mod test {
         assert_eq!(
             batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
             &[0, 0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_primitive_query_length_multiple_of_dim_is_rejected() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+        let q: Float32Array = (32..96).map(|v| v as f32).collect();
+
+        let err = match dataset.scan().nearest("vec", &q, 2) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("expected primitive query length mismatch error"),
+        };
+        assert!(
+            err.contains("query dim(64) doesn't match the column vec vector dim(32)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    async fn dataset_with_query_index_column() -> (TempStrDir, Dataset) {
+        let path = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    32,
+                ),
+                true,
+            ),
+            ArrowField::new(QUERY_INDEX_COL, DataType::UInt32, true),
+        ]));
+        let vector_values: Float32Array = (0..32 * 80).map(|v| v as f32).collect();
+        let vectors = FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..80)),
+                Arc::new(vectors),
+                Arc::new(UInt32Array::from_iter((0..80).map(|v| v as u32))),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(std::iter::once(Ok(batch)), schema.clone()),
+            &path,
+            None,
+        )
+        .await
+        .unwrap();
+        (path, dataset)
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_rejects_dataset_query_index_column() {
+        let (_tmp, dataset) = dataset_with_query_index_column().await;
+        let (queries, _) = batch_knn_two_queries();
+        let err = match dataset.scan().nearest("vec", &queries, 2) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("expected reserved query_index column error"),
+        };
+        assert!(err.contains(QUERY_INDEX_COL), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_rejects_selecting_dataset_query_index_column() {
+        let (_tmp, dataset) = dataset_with_query_index_column().await;
+        let (queries, _) = batch_knn_two_queries();
+        let err = match dataset.scan().nearest("vec", &queries, 2) {
+            Err(err) => err.to_string(),
+            Ok(scan) => match scan.project(&[QUERY_INDEX_COL]) {
+                Err(err) => err.to_string(),
+                Ok(scan) => match scan.try_into_batch().await {
+                    Err(err) => err.to_string(),
+                    Ok(_) => {
+                        panic!("expected error when batch nearest selects query_index column")
+                    }
+                },
+            },
+        };
+        assert!(err.contains(QUERY_INDEX_COL), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_single_knn_projects_dataset_query_index_column() {
+        let (_tmp, dataset) = dataset_with_query_index_column().await;
+        let q: Float32Array = (32..64).map(|v| v as f32).collect();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &q, 2).unwrap();
+        scan.use_index(false);
+        scan.project(&["i"]).unwrap();
+        let without_query_index = scan.try_into_batch().await.unwrap();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &q, 2).unwrap();
+        scan.use_index(false);
+        scan.project(&["i", QUERY_INDEX_COL]).unwrap();
+        let with_query_index = scan.try_into_batch().await.unwrap();
+
+        assert_eq!(without_query_index.num_rows(), 2);
+        assert_eq!(
+            without_query_index["i"]
+                .as_primitive::<Int32Type>()
+                .values(),
+            with_query_index["i"].as_primitive::<Int32Type>().values()
+        );
+        assert_eq!(
+            with_query_index[QUERY_INDEX_COL]
+                .as_primitive::<UInt32Type>()
+                .null_count(),
+            0
         );
     }
 

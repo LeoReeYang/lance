@@ -247,6 +247,42 @@ def _assert_batch_matches_single_queries(ds, queries, k, nearest_kwargs):
         )
 
 
+def test_batch_vector_search_rejects_dataset_query_index_column(tmp_path):
+    dim = 128
+    table = create_table(nvec=80, ndim=dim)
+    table = table.append_column(
+        "query_index",
+        pa.array(range(80), type=pa.uint32()),
+    )
+    ds = lance.write_dataset(table, tmp_path / "with_query_index")
+
+    queries = np.random.randn(2, dim).astype(np.float32)
+    with pytest.raises(Exception, match="query_index"):
+        ds.to_table(
+            columns=["id", "query_index"],
+            nearest={
+                "column": "vector",
+                "q": queries,
+                "k": 5,
+                "use_index": False,
+            },
+        )
+
+
+def test_flat_1d_query_length_multiple_of_dim_is_rejected(dataset):
+    q = np.random.randn(256).astype(np.float32)
+    with pytest.raises(ValueError, match=r"256.*128"):
+        dataset.to_table(
+            columns=["id"],
+            nearest={
+                "column": "vector",
+                "q": q,
+                "k": 5,
+                "use_index": False,
+            },
+        )
+
+
 def test_batch_flat_respects_distance_range(dataset):
     queries = np.random.randn(2, 128).astype(np.float32)
     _assert_batch_matches_single_queries(

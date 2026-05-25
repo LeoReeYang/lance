@@ -3,7 +3,7 @@
 
 use std::any::Any;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
@@ -277,8 +277,10 @@ impl KNNVectorDistanceExec {
         if input_schema.column_with_name(DIST_COL).is_some() {
             input_schema = input_schema.without_column(DIST_COL);
         }
-        if input_schema.column_with_name(QUERY_INDEX_COL).is_some() {
-            input_schema = input_schema.without_column(QUERY_INDEX_COL);
+        if is_batch && input_schema.column_with_name(QUERY_INDEX_COL).is_some() {
+            return Err(Error::invalid_input(format!(
+                "batch KNN cannot run when the input already contains reserved column '{QUERY_INDEX_COL}'"
+            )));
         }
         let input_schema = Arc::new(input_schema);
         let mut output_schema = input_schema.as_ref().clone();
@@ -351,6 +353,7 @@ impl KNNVectorDistanceExec {
             .map(|_| BinaryHeap::<BatchKnnCandidate>::with_capacity(k))
             .collect::<Vec<_>>();
         let mut input = input;
+        let mut source_batches = Vec::<Arc<RecordBatch>>::new();
 
         while let Some(batch) = input.next().await {
             let batch = batch?;
@@ -367,7 +370,9 @@ impl KNNVectorDistanceExec {
                 })?
                 .as_primitive::<UInt64Type>()
                 .clone();
+            let batch_index = source_batches.len() as u32;
             let batch = Arc::new(batch);
+            source_batches.push(batch.clone());
 
             for (query_index, heap) in heaps.iter_mut().enumerate().take(query_count) {
                 let key = query.slice(query_index * query_dim, query_dim);
@@ -393,7 +398,7 @@ impl KNNVectorDistanceExec {
                         query_index: query_index as u32,
                         distance,
                         row_id: row_ids.value(row_index),
-                        batch: batch.clone(),
+                        batch_index,
                         row_index: row_index as u32,
                     };
                     if heap.len() < k {
@@ -426,19 +431,42 @@ impl KNNVectorDistanceExec {
 
         let mut query_indices = UInt32Builder::with_capacity(results.len());
         let mut distances = Float32Builder::with_capacity(results.len());
-        let mut row_batches = Vec::with_capacity(results.len());
-        for result in results {
+        let mut row_batches = vec![None; results.len()];
+        let mut groups: BTreeMap<u32, Vec<(usize, u32)>> = BTreeMap::new();
+        for (out_idx, result) in results.iter().enumerate() {
+            groups
+                .entry(result.batch_index)
+                .or_default()
+                .push((out_idx, result.row_index));
+        }
+        for (batch_index, entries) in groups {
+            let row_indices =
+                UInt32Array::from_iter(entries.iter().map(|(_, row_index)| *row_index));
+            let taken = arrow_select::take::take_record_batch(
+                source_batches[batch_index as usize].as_ref(),
+                &row_indices,
+            )
+            .map_err(|e| {
+                DataFusionError::ArrowError(Box::new(e), Some("take top-k rows".to_string()))
+            })?;
+            for (slice_idx, (out_idx, _)) in entries.iter().enumerate() {
+                row_batches[*out_idx] = Some(taken.slice(slice_idx, 1));
+            }
+        }
+        for result in &results {
             query_indices.append_value(result.query_index);
             distances.append_value(result.distance);
-            let indices = UInt32Array::from(vec![result.row_index]);
-            row_batches.push(
-                arrow_select::take::take_record_batch(result.batch.as_ref(), &indices).map_err(
-                    |e| {
-                        DataFusionError::ArrowError(Box::new(e), Some("take top-k row".to_string()))
-                    },
-                )?,
-            );
         }
+        let row_batches = row_batches
+            .into_iter()
+            .map(|batch| {
+                batch.ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "missing materialized row for batch KNN result".to_string(),
+                    )
+                })
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
 
         let output = concat_batches(&input_schema, &row_batches)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
@@ -627,7 +655,7 @@ struct BatchKnnCandidate {
     query_index: u32,
     distance: f32,
     row_id: u64,
-    batch: Arc<RecordBatch>,
+    batch_index: u32,
     row_index: u32,
 }
 
