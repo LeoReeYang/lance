@@ -979,7 +979,8 @@ mod tests {
             .unwrap()
             .nearest("vector", array.value(0).as_primitive::<Float32Type>(), 2)
             .unwrap()
-            .refine(1)
+            // Over-fetch ANN candidates so delta-index HNSW recall is stable in CI.
+            .refine(4)
             .try_into_batch()
             .await
             .unwrap();
