@@ -88,7 +88,10 @@ jobs:
             *) echo "unsupported arch: ${arch}" >&2; exit 1 ;;
           esac
           url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${version}/cargo-deny-${version}-${target}.tar.gz"
-          curl -fsSL "${url}" | tar -xzf - -C /usr/local/bin --strip-components=1
+          install_dir="${HOME}/.local/bin"
+          mkdir -p "${install_dir}"
+          curl -fsSL "${url}" | tar -xzf - -C "${install_dir}" --strip-components=1
+          echo "${install_dir}" >> "${GITHUB_PATH}"
       - name: Run cargo-deny
         run: cargo deny check
 
