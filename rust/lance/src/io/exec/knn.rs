@@ -353,7 +353,10 @@ impl KNNVectorDistanceExec {
             .map(|_| BinaryHeap::<BatchKnnCandidate>::with_capacity(k))
             .collect::<Vec<_>>();
         let mut input = input;
-        let mut source_batches = Vec::<Arc<RecordBatch>>::new();
+        // Retain only input batches that still have a row in a query heap (at most
+        // `query_count * k` batches), instead of every scanned batch.
+        let mut cached_batches: HashMap<u32, Arc<RecordBatch>> = HashMap::new();
+        let mut batch_counter: u32 = 0;
 
         while let Some(batch) = input.next().await {
             let batch = batch?;
@@ -370,9 +373,9 @@ impl KNNVectorDistanceExec {
                 })?
                 .as_primitive::<UInt64Type>()
                 .clone();
-            let batch_index = source_batches.len() as u32;
+            let batch_index = batch_counter;
+            batch_counter += 1;
             let batch = Arc::new(batch);
-            source_batches.push(batch.clone());
 
             for (query_index, heap) in heaps.iter_mut().enumerate().take(query_count) {
                 let key = query.slice(query_index * query_dim, query_dim);
@@ -401,17 +404,32 @@ impl KNNVectorDistanceExec {
                         batch_index,
                         row_index: row_index as u32,
                     };
-                    if heap.len() < k {
+                    let entered_heap = if heap.len() < k {
                         heap.push(candidate);
+                        true
                     } else if heap
                         .peek()
                         .is_some_and(|worst| candidate.cmp(worst).is_lt())
                     {
                         heap.pop();
                         heap.push(candidate);
+                        true
+                    } else {
+                        false
+                    };
+                    if entered_heap {
+                        cached_batches
+                            .entry(batch_index)
+                            .or_insert_with(|| batch.clone());
                     }
                 }
             }
+
+            let referenced_batch_indices: HashSet<u32> = heaps
+                .iter()
+                .flat_map(|heap| heap.iter().map(|candidate| candidate.batch_index))
+                .collect();
+            cached_batches.retain(|batch_index, _| referenced_batch_indices.contains(batch_index));
         }
 
         let mut results = heaps
@@ -440,15 +458,17 @@ impl KNNVectorDistanceExec {
                 .push((out_idx, result.row_index));
         }
         for (batch_index, entries) in groups {
+            let source_batch = cached_batches.get(&batch_index).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "batch KNN missing cached input batch for index {batch_index}"
+                ))
+            })?;
             let row_indices =
                 UInt32Array::from_iter(entries.iter().map(|(_, row_index)| *row_index));
-            let taken = arrow_select::take::take_record_batch(
-                source_batches[batch_index as usize].as_ref(),
-                &row_indices,
-            )
-            .map_err(|e| {
-                DataFusionError::ArrowError(Box::new(e), Some("take top-k rows".to_string()))
-            })?;
+            let taken = arrow_select::take::take_record_batch(source_batch.as_ref(), &row_indices)
+                .map_err(|e| {
+                    DataFusionError::ArrowError(Box::new(e), Some("take top-k rows".to_string()))
+                })?;
             for (slice_idx, (out_idx, _)) in entries.iter().enumerate() {
                 row_batches[*out_idx] = Some(taken.slice(slice_idx, 1));
             }
