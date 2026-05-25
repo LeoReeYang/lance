@@ -4429,6 +4429,10 @@ impl Scanner {
             },
         )?);
 
+        if self.is_batch_nearest {
+            return Ok(flat_dist);
+        }
+
         let lower: Option<(Expr, Arc<dyn PhysicalExpr>)> = q
             .lower_bound
             .map(|v| -> Result<(Expr, Arc<dyn PhysicalExpr>)> {
@@ -4469,10 +4473,6 @@ impl Scanner {
         } else {
             flat_dist
         };
-
-        if self.is_batch_nearest {
-            return Self::flat_knn_not_null_filter(knn_plan);
-        }
 
         // Use DataFusion's [SortExec] for Top-K search
         let sort = SortExec::new(
@@ -5984,25 +5984,6 @@ mod test {
         let err = match dataset.scan().nearest("vec", &queries, 2) {
             Err(err) => err.to_string(),
             Ok(_) => panic!("expected reserved query_index column error"),
-        };
-        assert!(err.contains(QUERY_INDEX_COL), "unexpected error: {err}");
-    }
-
-    #[tokio::test]
-    async fn test_batch_knn_rejects_selecting_dataset_query_index_column() {
-        let (_tmp, dataset) = dataset_with_query_index_column().await;
-        let (queries, _) = batch_knn_two_queries();
-        let err = match dataset.scan().nearest("vec", &queries, 2) {
-            Err(err) => err.to_string(),
-            Ok(scan) => match scan.project(&[QUERY_INDEX_COL]) {
-                Err(err) => err.to_string(),
-                Ok(scan) => match scan.try_into_batch().await {
-                    Err(err) => err.to_string(),
-                    Ok(_) => {
-                        panic!("expected error when batch nearest selects query_index column")
-                    }
-                },
-            },
         };
         assert!(err.contains(QUERY_INDEX_COL), "unexpected error: {err}");
     }
