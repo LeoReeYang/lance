@@ -73,6 +73,24 @@ use super::utils::{
 
 pub const QUERY_INDEX_COL: &str = "query_index";
 
+/// Whether a computed flat KNN distance should participate in top-k selection.
+///
+/// Matches the single-query flat path: keep infinite distances and drop only
+/// null/NaN values.
+fn flat_knn_distance_is_candidate(
+    distances: &arrow::array::PrimitiveArray<Float32Type>,
+    row_index: usize,
+) -> Option<f32> {
+    if !distances.is_valid(row_index) {
+        return None;
+    }
+    let distance = distances.value(row_index);
+    if distance.is_nan() {
+        return None;
+    }
+    Some(distance)
+}
+
 pub struct AnnPartitionMetrics {
     index_metrics: IndexMetrics,
     partitions_ranked: Count,
@@ -385,11 +403,8 @@ impl KNNVectorDistanceExec {
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 let distances = with_distances[DIST_COL].as_primitive::<Float32Type>();
                 for row_index in 0..batch.num_rows() {
-                    if !distances.is_valid(row_index) {
-                        continue;
-                    }
-                    let distance = distances.value(row_index);
-                    if !distance.is_finite() {
+                    let Some(distance) = flat_knn_distance_is_candidate(distances, row_index)
+                    else {
                         continue;
                     };
                     if lower_bound.is_some_and(|lower_bound| distance < lower_bound)
@@ -591,11 +606,9 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                     let distances = batch[DIST_COL].as_primitive::<Float32Type>();
-                    let mask = BooleanArray::from_iter(
-                        distances
-                            .iter()
-                            .map(|v| Some(v.map(|v| !v.is_nan()).unwrap_or(false))),
-                    );
+                    let mask = BooleanArray::from_iter((0..distances.len()).map(|row_index| {
+                        Some(flat_knn_distance_is_candidate(distances, row_index).is_some())
+                    }));
                     arrow::compute::filter_record_batch(&batch, &mask)
                         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
                 }
@@ -2608,6 +2621,23 @@ mod tests {
         let indices = sort_to_indices(distances, None, Some(10)).unwrap();
         let expected = take_record_batch(&all_with_distances, &indices).unwrap();
         assert_eq!(expected, results[0]);
+    }
+
+    #[test]
+    fn flat_knn_distance_keeps_infinity() {
+        let distances = Float32Array::from(vec![
+            Some(f32::NAN),
+            Some(f32::INFINITY),
+            None,
+            Some(1.0),
+        ]);
+        assert!(flat_knn_distance_is_candidate(&distances, 0).is_none());
+        assert_eq!(
+            flat_knn_distance_is_candidate(&distances, 1),
+            Some(f32::INFINITY)
+        );
+        assert!(flat_knn_distance_is_candidate(&distances, 2).is_none());
+        assert_eq!(flat_knn_distance_is_candidate(&distances, 3), Some(1.0));
     }
 
     #[test]

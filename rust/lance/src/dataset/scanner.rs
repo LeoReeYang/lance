@@ -4471,7 +4471,7 @@ impl Scanner {
         };
 
         if self.is_batch_nearest {
-            return Ok(knn_plan);
+            return Self::flat_knn_not_null_filter(knn_plan);
         }
 
         // Use DataFusion's [SortExec] for Top-K search
@@ -4497,10 +4497,17 @@ impl Scanner {
         )
         .with_fetch(Some(q.k));
 
-        let logical_not_null = col(DIST_COL).is_not_null();
-        let not_nulls = Arc::new(LanceFilterExec::try_new(logical_not_null, Arc::new(sort))?);
+        Self::flat_knn_not_null_filter(Arc::new(sort))
+    }
 
-        Ok(not_nulls)
+    fn flat_knn_not_null_filter(
+        knn_plan: Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let logical_not_null = col(DIST_COL).is_not_null();
+        Ok(Arc::new(LanceFilterExec::try_new(
+            logical_not_null,
+            knn_plan,
+        )?))
     }
 
     fn get_fragments_as_bitmap(&self) -> RoaringBitmap {
