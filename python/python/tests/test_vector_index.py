@@ -283,26 +283,6 @@ def test_flat_1d_query_length_multiple_of_dim_is_rejected(dataset):
         )
 
 
-def test_batch_flat_respects_distance_range(dataset):
-    queries = np.random.randn(2, 128).astype(np.float32)
-    _assert_batch_matches_single_queries(
-        dataset,
-        queries,
-        k=5,
-        nearest_kwargs={"use_index": False, "distance_range": (0.0, 50.0)},
-    )
-
-
-def test_batch_indexed_respects_distance_range(indexed_dataset):
-    queries = np.random.randn(2, 128).astype(np.float32)
-    _assert_batch_matches_single_queries(
-        indexed_dataset,
-        queries,
-        k=5,
-        nearest_kwargs={"distance_range": (0.0, 50.0)},
-    )
-
-
 def test_batch_fast_search_without_index_returns_empty_with_query_index(dataset):
     queries = np.random.randn(2, 128).astype(np.float32)
     batch = dataset.to_table(

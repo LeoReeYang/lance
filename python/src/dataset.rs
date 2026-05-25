@@ -1368,26 +1368,22 @@ impl Dataset {
                 query_parallelism,
             ) = vector_query_params_from_dict(nearest, default_k)?;
 
-            let (vector_type, element_type) = get_vector_type(self_.ds.schema(), &column)
+            let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let is_batch_query = matches!(
-                q.data_type(),
-                DataType::List(_) | DataType::FixedSizeList(_, _)
-            ) && matches!(vector_type, DataType::FixedSizeList(_, _));
-            let scanner = match (is_batch_query, element_type) {
-                (true, DataType::UInt8) => {
-                    return Err(PyValueError::new_err(
-                        "Batch nearest is not supported for binary vector columns",
-                    ));
-                }
-                (false, DataType::UInt8) => {
+            let scanner = match element_type {
+                DataType::UInt8
+                    if !matches!(
+                        q.data_type(),
+                        DataType::List(_) | DataType::FixedSizeList(_, _)
+                    ) =>
+                {
                     let q = arrow::compute::cast(&q, &DataType::UInt8).map_err(|e| {
                         PyValueError::new_err(format!("Failed to cast q to binary vector: {}", e))
                     })?;
                     let q = q.as_primitive::<UInt8Type>();
                     scanner.nearest(&column, q, k)
                 }
-                (_, _) => scanner.nearest(&column, &q, k),
+                _ => scanner.nearest(&column, &q, k),
             };
             let distance_range: Option<(Option<f32>, Option<f32>)> =
                 if let Some(dr) = nearest.get_item("distance_range")? {
