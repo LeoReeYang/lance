@@ -1102,7 +1102,8 @@ class LanceDataset(pa.dataset.Dataset):
             ``q`` may also be a 2-D array-like value, or a list of vectors, for
             fixed-size vector columns. In that case Lance runs a batch nearest-neighbor
             query, returns up to ``k`` rows for each query vector, and adds
-            ``query_index`` to identify the source query for each result row.
+            an Int32 non-null ``query_index`` as the first output column to identify
+            the source query for each result row.
             Flattened 1-D arrays whose length is a multiple of the vector dimension are
             rejected. Datasets that already contain a ``query_index`` column cannot be
             used for batch nearest-neighbor search. When ``use_index`` is true and a
@@ -6005,9 +6006,10 @@ class ScannerBuilder:
         q: QueryVectorLike
             A single query vector or, for fixed-size vector columns, a 2-D array-like
             or list-shaped batch of query vectors. Batch queries return up to ``k`` rows
-            per query and include ``query_index`` in the output. Flattened 1-D inputs
-            whose length is a multiple of the vector dimension are rejected. Datasets
-            with an existing ``query_index`` column cannot be used for batch search.
+            per query and include Int32 non-null ``query_index`` as the first output
+            column. Flattened 1-D inputs whose length is a multiple of the vector
+            dimension are rejected. Datasets with an existing ``query_index`` column
+            cannot be used for batch search.
             When ``use_index`` is true and a vector index is available, each query
             vector is searched through the index path; otherwise the flat batch path
             is used.
@@ -7161,7 +7163,8 @@ def _build_vector_search_query(
     q: QueryVectorLike
         The query vector. For fixed-size vector columns, this may be a 2-D
         array-like or list-shaped batch of query vectors. Batch queries return up to
-        ``k`` rows per query vector and include ``query_index`` in the output.
+        ``k`` rows per query vector and include Int32 non-null ``query_index`` as
+        the first output column.
         Flattened 1-D inputs whose length is a multiple of the vector dimension are
         rejected. Datasets with an existing ``query_index`` column cannot be used for
         batch search. When ``use_index`` is true and a vector index is available,

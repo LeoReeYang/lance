@@ -203,7 +203,10 @@ def test_batch_flat_query_matches_repeated_single_queries(dataset, queries):
     )
 
     assert batch.num_rows == query_count * k
-    assert batch.column_names == ["id", "_distance", "query_index"]
+    assert batch.column_names == ["query_index", "id", "_distance"]
+    query_index_field = batch.schema.field("query_index")
+    assert query_index_field.type == pa.int32()
+    assert not query_index_field.nullable
     expected_query_index = sum([[i] * k for i in range(query_count)], [])
     assert batch["query_index"].to_pylist() == expected_query_index
 

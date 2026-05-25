@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
-use arrow::array::Float32Builder;
+use arrow::array::{Float32Builder, Int32Builder};
 use arrow::datatypes::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, Float32Array, UInt32Array, UInt64Array};
 use arrow_array::{
@@ -72,6 +72,10 @@ use super::utils::{
 };
 
 pub const QUERY_INDEX_COL: &str = "query_index";
+
+pub(crate) fn query_index_field() -> Field {
+    Field::new(QUERY_INDEX_COL, DataType::Int32, false)
+}
 
 /// Whether a computed flat KNN distance should participate in top-k selection.
 ///
@@ -301,14 +305,13 @@ impl KNNVectorDistanceExec {
             )));
         }
         let input_schema = Arc::new(input_schema);
-        let mut output_schema = input_schema.as_ref().clone();
-        if is_batch {
-            output_schema = output_schema.try_with_column(Field::new(
-                QUERY_INDEX_COL,
-                DataType::UInt32,
-                true,
-            ))?;
-        }
+        let output_schema = if is_batch {
+            input_schema
+                .as_ref()
+                .try_with_column_at(0, query_index_field())?
+        } else {
+            input_schema.as_ref().clone()
+        };
         let output_schema = Arc::new(output_schema.try_with_column(Field::new(
             DIST_COL,
             DataType::Float32,
@@ -404,7 +407,7 @@ impl KNNVectorDistanceExec {
                     {
                         continue;
                     }
-                    let query_index = query_index as u32;
+                    let query_index = query_index as i32;
                     let row_id = row_ids.value(row_index);
                     let row_index = row_index as u32;
                     let candidate_is_better = |worst: &BatchKnnCandidate| {
@@ -452,7 +455,7 @@ impl KNNVectorDistanceExec {
             return Ok(RecordBatch::new_empty(output_schema));
         }
 
-        let mut query_indices = UInt32Builder::with_capacity(results.len());
+        let mut query_indices = Int32Builder::with_capacity(results.len());
         let mut distances = Float32Builder::with_capacity(results.len());
         let mut row_batches = Vec::with_capacity(results.len());
         for result in results {
@@ -469,10 +472,7 @@ impl KNNVectorDistanceExec {
         let output = concat_batches(&input_schema, &row_batches)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         output
-            .try_with_column(
-                Field::new(QUERY_INDEX_COL, DataType::UInt32, true),
-                Arc::new(query_indices.finish()),
-            )
+            .try_with_column_at(0, query_index_field(), Arc::new(query_indices.finish()))
             .and_then(|batch| {
                 batch.try_with_column(
                     Field::new(DIST_COL, DataType::Float32, true),
@@ -628,9 +628,8 @@ impl ExecutionPlan for KNNVectorDistanceExec {
             .map(|(stats, _)| stats)
             .collect::<Vec<_>>();
         let column_statistics = if self.is_batch {
-            column_statistics
-                .into_iter()
-                .chain(std::iter::once(ColumnStatistics::default()))
+            std::iter::once(ColumnStatistics::default())
+                .chain(column_statistics)
                 .chain(std::iter::once(dist_stats))
                 .collect::<Vec<_>>()
         } else {
@@ -669,7 +668,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
 
 #[derive(Clone)]
 struct BatchKnnCandidate {
-    query_index: u32,
+    query_index: i32,
     distance: f32,
     row_id: u64,
     batch: RecordBatch,
@@ -712,7 +711,7 @@ pub fn knn_empty_result_schema(include_query_index: bool) -> SchemaRef {
         ROW_ID_FIELD.clone(),
     ];
     if include_query_index {
-        fields.push(Field::new(QUERY_INDEX_COL, DataType::UInt32, true));
+        fields.insert(0, query_index_field());
     }
     Arc::new(Schema::new(fields))
 }

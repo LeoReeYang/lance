@@ -101,7 +101,9 @@ use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
     LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
-    knn::{KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema, new_knn_exec},
+    knn::{
+        KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema, new_knn_exec, query_index_field,
+    },
     project,
 };
 use crate::io::exec::{AddRowOffsetExec, LanceFilterExec, LanceScanConfig, get_physical_optimizer};
@@ -1899,7 +1901,7 @@ impl Scanner {
         if self.nearest.as_ref().is_some() {
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
             if self.is_batch_nearest {
-                extra_columns.push(ArrowField::new(QUERY_INDEX_COL, DataType::UInt32, true));
+                extra_columns.push(query_index_field());
             }
         };
 
@@ -1962,11 +1964,21 @@ impl Scanner {
             }
         }
 
-        // Batch nearest queries expose the synthetic `query_index` discriminator separately
-        // from scoring-column autoprojection (`_distance` / `_score` above).
-        if self.is_batch_nearest && output_expr.iter().all(|(_, name)| name != QUERY_INDEX_COL) {
-            let query_index_expr = expressions::col(QUERY_INDEX_COL, current_schema)?;
-            output_expr.push((query_index_expr, QUERY_INDEX_COL.to_string()));
+        // Batch nearest queries expose the synthetic `query_index` discriminator as
+        // the first output column for compatibility with LanceDB batch vector search.
+        if self.is_batch_nearest {
+            let query_index_expr = if let Some(pos) = output_expr
+                .iter()
+                .position(|(_, name)| name == QUERY_INDEX_COL)
+            {
+                output_expr.remove(pos)
+            } else {
+                (
+                    expressions::col(QUERY_INDEX_COL, current_schema)?,
+                    QUERY_INDEX_COL.to_string(),
+                )
+            };
+            output_expr.insert(0, query_index_expr);
         }
 
         if self.legacy_with_row_id {
@@ -3811,7 +3823,7 @@ impl Scanner {
                 .await?;
             query_plans.push(Self::add_query_index_column(
                 single_plan,
-                query_index as u32,
+                query_index as i32,
             )?);
         }
 
@@ -3851,10 +3863,14 @@ impl Scanner {
 
     fn add_query_index_column(
         plan: Arc<dyn ExecutionPlan>,
-        query_index: u32,
+        query_index: i32,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = plan.schema();
         let mut projection_exprs = Vec::with_capacity(schema.fields().len() + 1);
+        projection_exprs.push((
+            Arc::new(Literal::new(ScalarValue::Int32(Some(query_index)))) as Arc<dyn PhysicalExpr>,
+            QUERY_INDEX_COL.to_string(),
+        ));
         for field in schema.fields() {
             projection_exprs.push((
                 Arc::new(Column::new_with_schema(field.name(), schema.as_ref())?)
@@ -3862,10 +3878,6 @@ impl Scanner {
                 field.name().clone(),
             ));
         }
-        projection_exprs.push((
-            Arc::new(Literal::new(ScalarValue::UInt32(Some(query_index)))) as Arc<dyn PhysicalExpr>,
-            QUERY_INDEX_COL.to_string(),
-        ));
         Ok(Arc::new(ProjectionExec::try_new(projection_exprs, plan)?))
     }
 
@@ -5833,11 +5845,11 @@ mod test {
             scan.project(&["i"]).unwrap();
             let single = scan.try_into_batch().await.unwrap();
 
-            let query_indices = batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>();
+            let query_indices = batch[QUERY_INDEX_COL].as_primitive::<Int32Type>();
             let mask = BooleanArray::from_iter(
                 query_indices
                     .iter()
-                    .map(|value| value.map(|value| value == query_index as u32)),
+                    .map(|value| value.map(|value| value == query_index as i32)),
             );
             let batch_slice = arrow::compute::filter_record_batch(batch, &mask).unwrap();
             assert_eq!(
@@ -5883,20 +5895,23 @@ mod test {
         );
 
         let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.schema().field(0).name(), QUERY_INDEX_COL);
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int32);
+        assert!(!batch.schema().field(0).is_nullable());
         assert_eq!(
             batch.num_rows(),
             2 * k,
             "batch flat KNN must return k rows per query vector"
         );
         assert_eq!(
-            batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
+            batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
             &[0, 0, 1, 1]
         );
-        let query_indices = batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>();
+        let query_indices = batch[QUERY_INDEX_COL].as_primitive::<Int32Type>();
         for query_index in 0..2 {
             let rows_for_query = query_indices
                 .iter()
-                .filter(|value| *value == Some(query_index as u32))
+                .filter(|value| *value == Some(query_index))
                 .count();
             assert_eq!(
                 rows_for_query, k,
@@ -5933,8 +5948,11 @@ mod test {
             batch.schema().column_with_name(QUERY_INDEX_COL).is_some(),
             "batch-shaped query with one vector should still return query_index"
         );
+        assert_eq!(batch.schema().field(0).name(), QUERY_INDEX_COL);
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int32);
+        assert!(!batch.schema().field(0).is_nullable());
         assert_eq!(
-            batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
+            batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
             &[0, 0]
         );
     }
@@ -6056,7 +6074,7 @@ mod test {
             .unwrap();
 
         assert_eq!(
-            batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
+            batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
             &[0, 0, 1, 1]
         );
         assert_batch_matches_single_queries(
@@ -6096,8 +6114,11 @@ mod test {
         );
 
         let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.schema().field(0).name(), QUERY_INDEX_COL);
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int32);
+        assert!(!batch.schema().field(0).is_nullable());
         assert_eq!(
-            batch[QUERY_INDEX_COL].as_primitive::<UInt32Type>().values(),
+            batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
             &[0, 0, 1, 1]
         );
 
@@ -10244,6 +10265,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let batch = scanner.try_into_batch().await.unwrap();
 
         assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.schema().field(0).name(), QUERY_INDEX_COL);
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int32);
+        assert!(!batch.schema().field(0).is_nullable());
         assert!(
             batch.schema().column_with_name(QUERY_INDEX_COL).is_some(),
             "batch fast_search without index should still expose query_index in schema"
