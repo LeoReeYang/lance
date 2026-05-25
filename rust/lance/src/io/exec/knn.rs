@@ -73,7 +73,7 @@ use super::utils::{
 
 pub const QUERY_INDEX_COL: &str = "query_index";
 
-pub(crate) fn query_index_field() -> Field {
+pub fn query_index_field() -> Field {
     Field::new(QUERY_INDEX_COL, DataType::Int32, false)
 }
 
