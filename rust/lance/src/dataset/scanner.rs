@@ -1529,9 +1529,8 @@ impl Scanner {
             }
         };
 
-        if Self::is_batch_nearest_query(&vector_type, &query_type)
-            && self.dataset.schema().field(QUERY_INDEX_COL).is_some()
-        {
+        let is_batch_nearest = Self::is_batch_nearest_query(&vector_type, &query_type);
+        if is_batch_nearest && self.dataset.schema().field(QUERY_INDEX_COL).is_some() {
             return Err(Error::invalid_input(format!(
                 "batch nearest neighbor search cannot be used on datasets with column '{QUERY_INDEX_COL}'"
             )));
@@ -1569,7 +1568,7 @@ impl Scanner {
             dist_q_c: 0.0,
         });
         self.nearest_query_count = query_count;
-        self.is_batch_nearest = Self::is_batch_nearest_query(&vector_type, &query_type);
+        self.is_batch_nearest = is_batch_nearest;
         Ok(self)
     }
 
@@ -5822,6 +5821,14 @@ mod test {
         (queries, query_values)
     }
 
+    fn assert_query_index_field(batch: &RecordBatch) {
+        let schema = batch.schema();
+        let field = schema.field(0);
+        assert_eq!(field.name(), QUERY_INDEX_COL);
+        assert_eq!(field.data_type(), &DataType::Int32);
+        assert!(!field.is_nullable());
+    }
+
     async fn assert_batch_matches_single_queries(
         dataset: &Dataset,
         batch: &RecordBatch,
@@ -5895,9 +5902,7 @@ mod test {
         );
 
         let batch = scan.try_into_batch().await.unwrap();
-        assert_eq!(batch.schema().field(0).name(), QUERY_INDEX_COL);
-        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int32);
-        assert!(!batch.schema().field(0).is_nullable());
+        assert_query_index_field(&batch);
         assert_eq!(
             batch.num_rows(),
             2 * k,
@@ -5944,13 +5949,7 @@ mod test {
         );
 
         let batch = scan.try_into_batch().await.unwrap();
-        assert!(
-            batch.schema().column_with_name(QUERY_INDEX_COL).is_some(),
-            "batch-shaped query with one vector should still return query_index"
-        );
-        assert_eq!(batch.schema().field(0).name(), QUERY_INDEX_COL);
-        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int32);
-        assert!(!batch.schema().field(0).is_nullable());
+        assert_query_index_field(&batch);
         assert_eq!(
             batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
             &[0, 0]
@@ -6114,9 +6113,7 @@ mod test {
         );
 
         let batch = scan.try_into_batch().await.unwrap();
-        assert_eq!(batch.schema().field(0).name(), QUERY_INDEX_COL);
-        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int32);
-        assert!(!batch.schema().field(0).is_nullable());
+        assert_query_index_field(&batch);
         assert_eq!(
             batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
             &[0, 0, 1, 1]
@@ -10265,13 +10262,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let batch = scanner.try_into_batch().await.unwrap();
 
         assert_eq!(batch.num_rows(), 0);
-        assert_eq!(batch.schema().field(0).name(), QUERY_INDEX_COL);
-        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int32);
-        assert!(!batch.schema().field(0).is_nullable());
-        assert!(
-            batch.schema().column_with_name(QUERY_INDEX_COL).is_some(),
-            "batch fast_search without index should still expose query_index in schema"
-        );
+        assert_query_index_field(&batch);
     }
 
     #[rstest]
