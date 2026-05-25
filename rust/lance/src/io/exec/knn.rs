@@ -2625,12 +2625,8 @@ mod tests {
 
     #[test]
     fn flat_knn_distance_keeps_infinity() {
-        let distances = Float32Array::from(vec![
-            Some(f32::NAN),
-            Some(f32::INFINITY),
-            None,
-            Some(1.0),
-        ]);
+        let distances =
+            Float32Array::from(vec![Some(f32::NAN), Some(f32::INFINITY), None, Some(1.0)]);
         assert!(flat_knn_distance_is_candidate(&distances, 0).is_none());
         assert_eq!(
             flat_knn_distance_is_candidate(&distances, 1),
