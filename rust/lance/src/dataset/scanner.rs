@@ -4424,6 +4424,14 @@ impl Scanner {
         } else {
             input
         };
+        let retain_vector = if self.is_batch_nearest {
+            let vector_field_id = self.dataset.schema().field_id(q.column.as_str())?;
+            self.projection_plan
+                .physical_projection
+                .contains_field_id(vector_field_id)
+        } else {
+            false
+        };
         let flat_dist = Arc::new(KNNVectorDistanceExec::try_new_batch(
             input,
             &q.column,
@@ -4435,6 +4443,7 @@ impl Scanner {
                 lower_bound: q.lower_bound,
                 upper_bound: q.upper_bound,
                 distance_type: metric_type,
+                retain_vector,
             },
         )?);
 
@@ -5974,6 +5983,25 @@ mod test {
             );
         }
         assert_batch_matches_single_queries(dataset, &batch, &query_values, k, false, None).await;
+
+        let mut scan_with_vec = dataset.scan();
+        scan_with_vec.nearest("vec", &queries, k).unwrap();
+        scan_with_vec.use_index(false);
+        scan_with_vec.project(&["i", "vec"]).unwrap();
+        let batch_with_vec = scan_with_vec.try_into_batch().await.unwrap();
+        assert!(
+            batch_with_vec.schema().column_with_name("vec").is_some(),
+            "batch flat KNN should return vector column when projected"
+        );
+        assert_batch_matches_single_queries(
+            dataset,
+            &batch_with_vec,
+            &query_values,
+            k,
+            false,
+            None,
+        )
+        .await;
 
         let query_values_one = (32..64).map(|v| v as f32).collect::<Vec<_>>();
         let queries_one = FixedSizeListArray::try_new_from_values(
