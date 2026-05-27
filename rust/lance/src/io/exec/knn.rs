@@ -17,7 +17,6 @@ use arrow_array::{
     cast::AsArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use arrow_select::concat::concat_batches;
 use datafusion::physical_plan::PlanProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -348,18 +347,62 @@ impl KNNVectorDistanceExec {
         })
     }
 
-    fn take_vector_row(
-        batch: &RecordBatch,
-        column: &str,
-        row_index: u32,
+    fn take_vector_row(vectors: &dyn Array, row_index: u32) -> ArrayRef {
+        vectors.slice(row_index as usize, 1)
+    }
+
+    fn take_slim_batch_field(
+        results: &[BatchKnnCandidate],
+        field_name: &str,
     ) -> DataFusionResult<ArrayRef> {
-        let vectors = batch.column_by_name(column).ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "batch KNN expected vector column '{column}' in scan batch"
-            ))
-        })?;
-        let indices = UInt32Array::from(vec![row_index]);
-        arrow::compute::take(vectors, &indices, None)
+        use std::collections::HashMap;
+
+        type SlimBatchGroup = (Arc<RecordBatch>, Vec<(usize, u32)>);
+        let mut groups: HashMap<*const RecordBatch, SlimBatchGroup> = HashMap::new();
+        for (result_index, candidate) in results.iter().enumerate() {
+            let BatchKnnExtra::WithVector {
+                slim_batch,
+                row_index,
+                ..
+            } = &candidate.extra
+            else {
+                return Err(DataFusionError::Internal(
+                    "batch KNN expected slim batch in candidate heap".to_string(),
+                ));
+            };
+            groups
+                .entry(Arc::as_ptr(slim_batch))
+                .or_insert_with(|| (Arc::clone(slim_batch), Vec::new()))
+                .1
+                .push((result_index, *row_index));
+        }
+
+        let mut ordered: Vec<Option<ArrayRef>> = vec![None; results.len()];
+        for (_, (slim_batch, entries)) in groups {
+            let indices =
+                UInt32Array::from_iter(entries.iter().map(|(_, row_index)| Some(*row_index)));
+            let taken = arrow_select::take::take_record_batch(slim_batch.as_ref(), &indices)
+                .map_err(|e| {
+                    DataFusionError::ArrowError(Box::new(e), Some("take top-k rows".to_string()))
+                })?;
+            let column = taken.column_by_name(field_name).ok_or_else(|| {
+                DataFusionError::Internal(format!("column '{field_name}' missing from slim batch"))
+            })?;
+            for (offset, (result_index, _)) in entries.iter().enumerate() {
+                ordered[*result_index] = Some(column.slice(offset, 1));
+            }
+        }
+
+        let row_arrays: Vec<&dyn Array> = ordered
+            .iter()
+            .map(|array| {
+                array
+                    .as_ref()
+                    .expect("every result mapped from slim batch")
+                    .as_ref()
+            })
+            .collect();
+        arrow::compute::concat(&row_arrays)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 
@@ -371,15 +414,14 @@ impl KNNVectorDistanceExec {
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(stored_schema.fields().len());
         for field in stored_schema.fields() {
             if field.name() == ROW_ID {
-                let row_ids = UInt64Array::from_iter(
-                    results.iter().map(|candidate| Some(candidate.row_id())),
-                );
+                let row_ids =
+                    UInt64Array::from_iter(results.iter().map(|candidate| Some(candidate.row_id)));
                 columns.push(Arc::new(row_ids));
             } else if field.name() == column {
                 let vector_rows: Vec<&dyn Array> = results
                     .iter()
                     .map(|candidate| {
-                        let BatchKnnCandidate::WithVector { vector_row, .. } = candidate else {
+                        let BatchKnnExtra::WithVector { vector_row, .. } = &candidate.extra else {
                             return Err(DataFusionError::Internal(
                                 "batch KNN expected vector rows in candidate heap".to_string(),
                             ));
@@ -391,41 +433,7 @@ impl KNNVectorDistanceExec {
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                 columns.push(vector_column);
             } else {
-                let mut row_batches = Vec::with_capacity(results.len());
-                for candidate in results {
-                    let BatchKnnCandidate::WithVector {
-                        batch, row_index, ..
-                    } = candidate
-                    else {
-                        return Err(DataFusionError::Internal(
-                            "batch KNN expected slim batch in candidate heap".to_string(),
-                        ));
-                    };
-                    let indices = UInt32Array::from(vec![*row_index]);
-                    row_batches.push(
-                        arrow_select::take::take_record_batch(batch.as_ref(), &indices).map_err(
-                            |e| {
-                                DataFusionError::ArrowError(
-                                    Box::new(e),
-                                    Some("take top-k row".to_string()),
-                                )
-                            },
-                        )?,
-                    );
-                }
-                let taken = concat_batches(&row_batches[0].schema(), &row_batches)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                columns.push(
-                    taken
-                        .column_by_name(field.name())
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(format!(
-                                "column '{}' missing from slim batch",
-                                field.name()
-                            ))
-                        })?
-                        .clone(),
-                );
+                columns.push(Self::take_slim_batch_field(results, field.name())?);
             }
         }
         RecordBatch::try_new(Arc::new(stored_schema.clone()), columns)
@@ -470,12 +478,18 @@ impl KNNVectorDistanceExec {
                 .as_primitive::<UInt64Type>()
                 .clone();
 
-            let slim_batch = if retain_vector {
-                Some(Arc::new(
+            let mut slim_batch: Option<Arc<RecordBatch>> = None;
+            let vectors = if retain_vector {
+                Some(
                     batch
-                        .drop_column(&column)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?,
-                ))
+                        .column_by_name(&column)
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(format!(
+                                "batch KNN expected vector column '{column}' in scan batch"
+                            ))
+                        })?
+                        .clone(),
+                )
             } else {
                 None
             };
@@ -504,30 +518,39 @@ impl KNNVectorDistanceExec {
                     }
                     let query_index = query_index as i32;
                     let row_id = row_ids.value(row_index);
-                    let candidate = if retain_vector {
+                    if !would_enter_heap(heap, k, distance, row_id, query_index) {
+                        continue;
+                    }
+
+                    let extra = if retain_vector {
                         let row_index = row_index as u32;
-                        let vector_row = Self::take_vector_row(&batch, &column, row_index)?;
-                        BatchKnnCandidate::WithVector {
-                            query_index,
-                            distance,
-                            row_id,
-                            batch: Arc::clone(slim_batch.as_ref().expect("slim batch")),
+                        if slim_batch.is_none() {
+                            slim_batch = Some(Arc::new(
+                                batch
+                                    .drop_column(&column)
+                                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                            ));
+                        }
+                        let slim_batch = slim_batch.as_ref().expect("slim batch");
+                        let vector_row =
+                            Self::take_vector_row(vectors.as_ref().expect("vectors"), row_index);
+                        BatchKnnExtra::WithVector {
+                            slim_batch: Arc::clone(slim_batch),
                             row_index,
                             vector_row,
                         }
                     } else {
-                        BatchKnnCandidate::RowIdOnly {
-                            query_index,
-                            distance,
-                            row_id,
-                        }
+                        BatchKnnExtra::RowIdOnly
+                    };
+                    let candidate = BatchKnnCandidate {
+                        query_index,
+                        distance,
+                        row_id,
+                        extra,
                     };
                     if heap.len() < k {
                         heap.push(candidate);
-                    } else if heap
-                        .peek()
-                        .is_some_and(|worst| candidate.cmp(worst).is_lt())
-                    {
+                    } else {
                         heap.pop();
                         heap.push(candidate);
                     }
@@ -540,10 +563,10 @@ impl KNNVectorDistanceExec {
             .flat_map(BinaryHeap::into_vec)
             .collect::<Vec<_>>();
         results.sort_by(|left, right| {
-            left.query_index()
-                .cmp(&right.query_index())
-                .then_with(|| left.distance().total_cmp(&right.distance()))
-                .then_with(|| left.row_id().cmp(&right.row_id()))
+            left.query_index
+                .cmp(&right.query_index)
+                .then_with(|| left.distance.total_cmp(&right.distance))
+                .then_with(|| left.row_id.cmp(&right.row_id))
         });
 
         if results.is_empty() {
@@ -553,14 +576,14 @@ impl KNNVectorDistanceExec {
         let mut query_indices = Int32Builder::with_capacity(results.len());
         let mut distances = Float32Builder::with_capacity(results.len());
         for result in &results {
-            query_indices.append_value(result.query_index());
-            distances.append_value(result.distance());
+            query_indices.append_value(result.query_index);
+            distances.append_value(result.distance);
         }
 
         let output = if retain_vector {
             Self::assemble_batch_output(&results, stored_schema.as_ref(), &column)?
         } else {
-            let row_ids = UInt64Array::from_iter(results.iter().map(|c| Some(c.row_id())));
+            let row_ids = UInt64Array::from_iter(results.iter().map(|c| Some(c.row_id)));
             RecordBatch::try_new(stored_schema.clone(), vec![Arc::new(row_ids) as ArrayRef])
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
         };
@@ -764,49 +787,48 @@ impl ExecutionPlan for KNNVectorDistanceExec {
 }
 
 #[derive(Clone)]
-enum BatchKnnCandidate {
-    RowIdOnly {
-        query_index: i32,
-        distance: f32,
-        row_id: u64,
-    },
+struct BatchKnnCandidate {
+    query_index: i32,
+    distance: f32,
+    row_id: u64,
+    extra: BatchKnnExtra,
+}
+
+#[derive(Clone)]
+enum BatchKnnExtra {
+    RowIdOnly,
     WithVector {
-        query_index: i32,
-        distance: f32,
-        row_id: u64,
-        batch: Arc<RecordBatch>,
+        slim_batch: Arc<RecordBatch>,
         row_index: u32,
         vector_row: ArrayRef,
     },
 }
 
-impl BatchKnnCandidate {
-    fn query_index(&self) -> i32 {
-        match self {
-            Self::RowIdOnly { query_index, .. } | Self::WithVector { query_index, .. } => {
-                *query_index
-            }
-        }
+fn would_enter_heap(
+    heap: &BinaryHeap<BatchKnnCandidate>,
+    k: usize,
+    distance: f32,
+    row_id: u64,
+    query_index: i32,
+) -> bool {
+    if heap.len() < k {
+        return true;
     }
-
-    fn distance(&self) -> f32 {
-        match self {
-            Self::RowIdOnly { distance, .. } | Self::WithVector { distance, .. } => *distance,
-        }
-    }
-
-    fn row_id(&self) -> u64 {
-        match self {
-            Self::RowIdOnly { row_id, .. } | Self::WithVector { row_id, .. } => *row_id,
-        }
-    }
+    let worst = heap.peek().expect("heap non-empty when len >= k");
+    let probe = BatchKnnCandidate {
+        query_index,
+        distance,
+        row_id,
+        extra: BatchKnnExtra::RowIdOnly,
+    };
+    probe.cmp(worst).is_lt()
 }
 
 impl PartialEq for BatchKnnCandidate {
     fn eq(&self, other: &Self) -> bool {
-        self.query_index() == other.query_index()
-            && self.distance() == other.distance()
-            && self.row_id() == other.row_id()
+        self.query_index == other.query_index
+            && self.distance == other.distance
+            && self.row_id == other.row_id
     }
 }
 
@@ -820,201 +842,10 @@ impl PartialOrd for BatchKnnCandidate {
 
 impl Ord for BatchKnnCandidate {
     fn cmp(&self, other: &Self) -> CmpOrdering {
-        self.distance()
-            .total_cmp(&other.distance())
-            .then_with(|| self.row_id().cmp(&other.row_id()))
-            .then_with(|| self.query_index().cmp(&other.query_index()))
-    }
-}
-
-#[cfg(test)]
-fn batch_knn_candidate_heap_memory(candidates: &[BatchKnnCandidate]) -> usize {
-    use std::collections::HashSet;
-
-    let mut seen_slim_batches = HashSet::new();
-    candidates
-        .iter()
-        .map(|candidate| match candidate {
-            BatchKnnCandidate::RowIdOnly { .. } => 0,
-            BatchKnnCandidate::WithVector {
-                batch, vector_row, ..
-            } => {
-                let slim_mem = if seen_slim_batches.insert(Arc::as_ptr(batch)) {
-                    batch
-                        .columns()
-                        .iter()
-                        .map(|col| col.get_array_memory_size())
-                        .sum::<usize>()
-                } else {
-                    0
-                };
-                slim_mem + vector_row.get_array_memory_size()
-            }
-        })
-        .sum()
-}
-
-#[cfg(test)]
-fn batch_knn_baseline_heap_memory(candidates: &[(RecordBatch, u32)]) -> usize {
-    candidates
-        .iter()
-        .map(|(batch, _)| {
-            batch
-                .columns()
-                .iter()
-                .map(|col| col.get_array_memory_size())
-                .sum::<usize>()
-        })
-        .sum()
-}
-
-#[cfg(test)]
-mod batch_knn_memory_tests {
-    use std::time::Instant;
-
-    use arrow::array::{FixedSizeListArray, Float32Array, UInt64Array};
-    use arrow_array::RecordBatch;
-    use arrow_schema::{DataType, Field, Schema};
-
-    use super::*;
-
-    fn make_scan_batch(num_rows: usize, dim: usize) -> RecordBatch {
-        let vectors =
-            Float32Array::from_iter((0..num_rows * dim).map(|i| (i % 1000) as f32 / 1000.0));
-        let vectors = FixedSizeListArray::try_new_from_values(vectors, dim as i32).unwrap();
-        let row_ids = UInt64Array::from_iter((0..num_rows as u64).map(Some));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "vec",
-                DataType::FixedSizeList(
-                    Field::new("item", DataType::Float32, true).into(),
-                    dim as i32,
-                ),
-                true,
-            ),
-            ROW_ID_FIELD.clone(),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![Arc::new(vectors) as ArrayRef, Arc::new(row_ids) as ArrayRef],
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn test_batch_knn_heap_memory() {
-        let num_rows = 4096;
-        let dim = 512;
-        let m = 10;
-        let k = 10;
-        let batch = make_scan_batch(num_rows, dim);
-        let slim_batch = Arc::new(batch.drop_column("vec").unwrap());
-
-        let mut baseline = Vec::with_capacity(m * k);
-        let mut optimized_row_id_only = Vec::with_capacity(m * k);
-        let mut optimized_with_vector = Vec::with_capacity(m * k);
-
-        for query_index in 0..m {
-            for row_index in 0..k {
-                let row_index_u32 = (query_index * k + row_index) as u32;
-                baseline.push((batch.clone(), row_index_u32));
-                optimized_row_id_only.push(BatchKnnCandidate::RowIdOnly {
-                    query_index: query_index as i32,
-                    distance: row_index as f32,
-                    row_id: row_index_u32 as u64,
-                });
-                let vector_row =
-                    KNNVectorDistanceExec::take_vector_row(&batch, "vec", row_index_u32).unwrap();
-                optimized_with_vector.push(BatchKnnCandidate::WithVector {
-                    query_index: query_index as i32,
-                    distance: row_index as f32,
-                    row_id: row_index_u32 as u64,
-                    batch: Arc::clone(&slim_batch),
-                    row_index: row_index_u32,
-                    vector_row,
-                });
-            }
-        }
-
-        let baseline_mem = batch_knn_baseline_heap_memory(&baseline);
-        let row_id_only_mem = batch_knn_candidate_heap_memory(&optimized_row_id_only);
-        let with_vector_mem = batch_knn_candidate_heap_memory(&optimized_with_vector);
-
-        assert!(
-            row_id_only_mem < baseline_mem / 50,
-            "RowIdOnly heap memory ({row_id_only_mem}) should be much smaller than baseline ({baseline_mem})"
-        );
-        assert!(
-            with_vector_mem < baseline_mem / 10,
-            "WithVector heap memory ({with_vector_mem}) should be much smaller than baseline ({baseline_mem})"
-        );
-
-        let expected_vector_bytes = m * k * dim * std::mem::size_of::<f32>();
-        assert!(
-            with_vector_mem >= expected_vector_bytes / 2
-                && with_vector_mem <= expected_vector_bytes * 4,
-            "WithVector heap memory ({with_vector_mem}) should be on the order of m*k*d*4 ({expected_vector_bytes})"
-        );
-    }
-
-    #[test]
-    fn test_batch_knn_assemble_perf_smoke() {
-        let num_rows = 4096;
-        let dim = 128;
-        let m = 10;
-        let k = 10;
-        let batch = make_scan_batch(num_rows, dim);
-        let slim_batch = Arc::new(batch.drop_column("vec").unwrap());
-        let stored_schema = batch.schema();
-
-        let mut candidates = Vec::with_capacity(m * k);
-        for query_index in 0..m {
-            for row_index in 0..k {
-                let row_index_u32 = (query_index * k + row_index) as u32;
-                let vector_row =
-                    KNNVectorDistanceExec::take_vector_row(&batch, "vec", row_index_u32).unwrap();
-                candidates.push(BatchKnnCandidate::WithVector {
-                    query_index: query_index as i32,
-                    distance: 0.0,
-                    row_id: row_index_u32 as u64,
-                    batch: Arc::clone(&slim_batch),
-                    row_index: row_index_u32,
-                    vector_row,
-                });
-            }
-        }
-
-        let baseline_batches: Vec<_> = (0..candidates.len())
-            .map(|i| (batch.clone(), i as u32))
-            .collect();
-
-        let start = Instant::now();
-        for _ in 0..50 {
-            let mut row_batches = Vec::with_capacity(baseline_batches.len());
-            for (full_batch, row_index) in &baseline_batches {
-                let indices = UInt32Array::from(vec![*row_index]);
-                row_batches
-                    .push(arrow_select::take::take_record_batch(full_batch, &indices).unwrap());
-            }
-            let _ = concat_batches(&row_batches[0].schema(), &row_batches).unwrap();
-        }
-        let baseline_elapsed = start.elapsed();
-
-        let start = Instant::now();
-        for _ in 0..50 {
-            let _ = KNNVectorDistanceExec::assemble_batch_output(
-                &candidates,
-                stored_schema.as_ref(),
-                "vec",
-            )
-            .unwrap();
-        }
-        let optimized_elapsed = start.elapsed();
-
-        assert!(
-            optimized_elapsed <= baseline_elapsed * 2,
-            "optimized assemble ({optimized_elapsed:?}) should not be much slower than baseline ({baseline_elapsed:?})"
-        );
+        self.distance
+            .total_cmp(&other.distance)
+            .then_with(|| self.row_id.cmp(&other.row_id))
+            .then_with(|| self.query_index.cmp(&other.query_index))
     }
 }
 

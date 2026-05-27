@@ -5888,6 +5888,14 @@ mod test {
         assert!(!field.is_nullable());
     }
 
+    fn assert_batch_knn_output_has_no_vector(batch: &RecordBatch) {
+        assert!(
+            batch.schema().column_with_name("vec").is_none(),
+            "batch flat KNN output must not include vector column when vec is not projected; columns: {:?}",
+            batch.schema().field_names()
+        );
+    }
+
     async fn assert_batch_matches_single_queries(
         dataset: &Dataset,
         batch: &RecordBatch,
@@ -5962,6 +5970,7 @@ mod test {
 
         let batch = scan.try_into_batch().await.unwrap();
         assert_query_index_field(&batch);
+        assert_batch_knn_output_has_no_vector(&batch);
         assert_eq!(
             batch.num_rows(),
             2 * k,
@@ -6028,9 +6037,50 @@ mod test {
 
         let batch = scan.try_into_batch().await.unwrap();
         assert_query_index_field(&batch);
+        assert_batch_knn_output_has_no_vector(&batch);
         assert_eq!(
             batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
             &[0, 0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_flat_omits_vector_without_projection() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+        let k = 2;
+        let (queries, query_values) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        scan.use_index(false);
+        scan.project(&["i"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_batch_knn_output_has_no_vector(&batch);
+        assert_query_index_field(&batch);
+        assert!(batch.schema().column_with_name("i").is_some());
+        assert!(batch.schema().column_with_name(DIST_COL).is_some());
+        assert_batch_matches_single_queries(dataset, &batch, &query_values, k, false, None).await;
+
+        let mut scan_rowid_only = dataset.scan();
+        scan_rowid_only.nearest("vec", &queries, k).unwrap();
+        scan_rowid_only.use_index(false);
+        scan_rowid_only.project(&[ROW_ID]).unwrap();
+        let batch_rowid_only = scan_rowid_only.try_into_batch().await.unwrap();
+        assert_batch_knn_output_has_no_vector(&batch_rowid_only);
+        assert!(batch_rowid_only.schema().column_with_name(ROW_ID).is_some());
+        assert!(batch_rowid_only.schema().column_with_name("i").is_none());
+
+        let mut scan_with_vec = dataset.scan();
+        scan_with_vec.nearest("vec", &queries, k).unwrap();
+        scan_with_vec.use_index(false);
+        scan_with_vec.project(&["vec"]).unwrap();
+        let batch_with_vec = scan_with_vec.try_into_batch().await.unwrap();
+        assert!(
+            batch_with_vec.schema().column_with_name("vec").is_some(),
+            "batch flat KNN must include vector column when vec is projected"
         );
     }
 
