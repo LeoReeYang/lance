@@ -5880,6 +5880,60 @@ mod test {
         (queries, query_values)
     }
 
+    async fn nested_vector_test_dataset(dim: u32) -> (TempStrDir, Dataset) {
+        let path = TempStrDir::default();
+        let vec_field = ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            true,
+        );
+        let payload_field = ArrowField::new(
+            "payload",
+            DataType::Struct(vec![vec_field.clone()].into()),
+            true,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            payload_field.clone(),
+        ]));
+
+        let batches: Vec<RecordBatch> = (0..5)
+            .map(|batch_idx| {
+                let vector_values: Float32Array = (0..dim * 80).map(|v| v as f32).collect();
+                let vectors =
+                    FixedSizeListArray::try_new_from_values(vector_values, dim as i32).unwrap();
+                let payload = StructArray::from(vec![(
+                    Arc::new(vec_field.clone()),
+                    Arc::new(vectors) as ArrayRef,
+                )]);
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(
+                            batch_idx * 80..(batch_idx + 1) * 80,
+                        )),
+                        Arc::new(payload),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let params = WriteParams {
+            max_rows_per_group: 10,
+            max_rows_per_file: 200,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, &path, Some(params)).await.unwrap();
+        (path, dataset)
+    }
+
     fn assert_query_index_field(batch: &RecordBatch) {
         let schema = batch.schema();
         let field = schema.field(0);
@@ -5888,10 +5942,10 @@ mod test {
         assert!(!field.is_nullable());
     }
 
-    fn assert_batch_knn_output_has_no_vector(batch: &RecordBatch) {
+    fn assert_batch_knn_output_has_no_vector(batch: &RecordBatch, vector_column: &str) {
         assert!(
-            batch.schema().column_with_name("vec").is_none(),
-            "batch flat KNN output must not include vector column when vec is not projected; columns: {:?}",
+            batch.schema().column_with_name(vector_column).is_none(),
+            "batch flat KNN output must not include vector column '{vector_column}' when it is not projected; columns: {:?}",
             batch.schema().field_names()
         );
     }
@@ -5970,7 +6024,7 @@ mod test {
 
         let batch = scan.try_into_batch().await.unwrap();
         assert_query_index_field(&batch);
-        assert_batch_knn_output_has_no_vector(&batch);
+        assert_batch_knn_output_has_no_vector(&batch, "vec");
         assert_eq!(
             batch.num_rows(),
             2 * k,
@@ -6037,7 +6091,7 @@ mod test {
 
         let batch = scan.try_into_batch().await.unwrap();
         assert_query_index_field(&batch);
-        assert_batch_knn_output_has_no_vector(&batch);
+        assert_batch_knn_output_has_no_vector(&batch, "vec");
         assert_eq!(
             batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
             &[0, 0]
@@ -6058,7 +6112,7 @@ mod test {
         scan.use_index(false);
         scan.project(&["i"]).unwrap();
         let batch = scan.try_into_batch().await.unwrap();
-        assert_batch_knn_output_has_no_vector(&batch);
+        assert_batch_knn_output_has_no_vector(&batch, "vec");
         assert_query_index_field(&batch);
         assert!(batch.schema().column_with_name("i").is_some());
         assert!(batch.schema().column_with_name(DIST_COL).is_some());
@@ -6069,7 +6123,7 @@ mod test {
         scan_rowid_only.use_index(false);
         scan_rowid_only.project(&[ROW_ID]).unwrap();
         let batch_rowid_only = scan_rowid_only.try_into_batch().await.unwrap();
-        assert_batch_knn_output_has_no_vector(&batch_rowid_only);
+        assert_batch_knn_output_has_no_vector(&batch_rowid_only, "vec");
         assert!(batch_rowid_only.schema().column_with_name(ROW_ID).is_some());
         assert!(batch_rowid_only.schema().column_with_name("i").is_none());
 
@@ -6101,7 +6155,7 @@ mod test {
         let batch = scan.try_into_batch().await.unwrap();
 
         assert_query_index_field(&batch);
-        assert_batch_knn_output_has_no_vector(&batch);
+        assert_batch_knn_output_has_no_vector(&batch, "vec");
         assert!(batch.schema().column_with_name("i").is_some());
 
         let query_indices = batch[QUERY_INDEX_COL].as_primitive::<Int32Type>();
@@ -6126,6 +6180,38 @@ mod test {
                 single_batch["i"].as_primitive::<Int32Type>().values()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_flat_nested_vector_projection() {
+        const VECTOR_COLUMN: &str = "payload.vec";
+        let (_tmp, dataset) = nested_vector_test_dataset(32).await;
+        let k = 2;
+        let (queries, _query_values) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest(VECTOR_COLUMN, &queries, k).unwrap();
+        scan.use_index(false);
+        scan.project(&["i"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        assert_batch_knn_output_has_no_vector(&batch, VECTOR_COLUMN);
+        assert_eq!(batch.num_rows(), 2 * k);
+        assert!(batch.schema().column_with_name("i").is_some());
+
+        let mut scan_with_vec = dataset.scan();
+        scan_with_vec.nearest(VECTOR_COLUMN, &queries, k).unwrap();
+        scan_with_vec.use_index(false);
+        scan_with_vec.project(&[VECTOR_COLUMN]).unwrap();
+        let batch_with_vec = scan_with_vec.try_into_batch().await.unwrap();
+        assert!(
+            batch_with_vec
+                .schema()
+                .column_with_name(VECTOR_COLUMN)
+                .is_some(),
+            "batch flat KNN must include nested vector column when projected; columns: {:?}",
+            batch_with_vec.schema().field_names()
+        );
     }
 
     #[tokio::test]

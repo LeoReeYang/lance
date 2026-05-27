@@ -487,7 +487,7 @@ impl KNNVectorDistanceExec {
             let vectors = if retain_vector {
                 Some(
                     batch
-                        .column_by_name(&column)
+                        .column_by_qualified_name(&column)
                         .ok_or_else(|| {
                             DataFusionError::Internal(format!(
                                 "batch KNN expected vector column '{column}' in scan batch"
