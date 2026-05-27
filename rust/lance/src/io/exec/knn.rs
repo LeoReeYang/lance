@@ -292,7 +292,7 @@ impl KNNVectorDistanceExec {
         }
 
         let stored_schema = if is_batch && !retain_vector {
-            Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]))
+            Arc::new(input_schema.without_column(column))
         } else {
             Arc::new(input_schema)
         };
@@ -360,7 +360,7 @@ impl KNNVectorDistanceExec {
         type SlimBatchGroup = (Arc<RecordBatch>, Vec<(usize, u32)>);
         let mut groups: HashMap<*const RecordBatch, SlimBatchGroup> = HashMap::new();
         for (result_index, candidate) in results.iter().enumerate() {
-            let BatchKnnExtra::WithVector {
+            let BatchKnnExtra::WithSlimBatch {
                 slim_batch,
                 row_index,
                 ..
@@ -421,7 +421,11 @@ impl KNNVectorDistanceExec {
                 let vector_rows: Vec<&dyn Array> = results
                     .iter()
                     .map(|candidate| {
-                        let BatchKnnExtra::WithVector { vector_row, .. } = &candidate.extra else {
+                        let BatchKnnExtra::WithSlimBatch {
+                            vector_row: Some(vector_row),
+                            ..
+                        } = &candidate.extra
+                        else {
                             return Err(DataFusionError::Internal(
                                 "batch KNN expected vector rows in candidate heap".to_string(),
                             ));
@@ -457,6 +461,7 @@ impl KNNVectorDistanceExec {
             retain_vector,
         } = config;
         let query_dim = query.len() / query_count;
+        let needs_slim_batch = stored_schema.fields().iter().any(|f| f.name() != ROW_ID);
         let mut heaps = (0..query_count)
             .map(|_| BinaryHeap::<BatchKnnCandidate>::with_capacity(k))
             .collect::<Vec<_>>();
@@ -522,7 +527,7 @@ impl KNNVectorDistanceExec {
                         continue;
                     }
 
-                    let extra = if retain_vector {
+                    let extra = if retain_vector || needs_slim_batch {
                         let row_index = row_index as u32;
                         if slim_batch.is_none() {
                             slim_batch = Some(Arc::new(
@@ -532,9 +537,15 @@ impl KNNVectorDistanceExec {
                             ));
                         }
                         let slim_batch = slim_batch.as_ref().expect("slim batch");
-                        let vector_row =
-                            Self::take_vector_row(vectors.as_ref().expect("vectors"), row_index);
-                        BatchKnnExtra::WithVector {
+                        let vector_row = if retain_vector {
+                            Some(Self::take_vector_row(
+                                vectors.as_ref().expect("vectors"),
+                                row_index,
+                            ))
+                        } else {
+                            None
+                        };
+                        BatchKnnExtra::WithSlimBatch {
                             slim_batch: Arc::clone(slim_batch),
                             row_index,
                             vector_row,
@@ -580,13 +591,7 @@ impl KNNVectorDistanceExec {
             distances.append_value(result.distance);
         }
 
-        let output = if retain_vector {
-            Self::assemble_batch_output(&results, stored_schema.as_ref(), &column)?
-        } else {
-            let row_ids = UInt64Array::from_iter(results.iter().map(|c| Some(c.row_id)));
-            RecordBatch::try_new(stored_schema.clone(), vec![Arc::new(row_ids) as ArrayRef])
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
-        };
+        let output = Self::assemble_batch_output(&results, stored_schema.as_ref(), &column)?;
 
         output
             .try_with_column_at(0, query_index_field(), Arc::new(query_indices.finish()))
@@ -797,10 +802,10 @@ struct BatchKnnCandidate {
 #[derive(Clone)]
 enum BatchKnnExtra {
     RowIdOnly,
-    WithVector {
+    WithSlimBatch {
         slim_batch: Arc<RecordBatch>,
         row_index: u32,
-        vector_row: ArrayRef,
+        vector_row: Option<ArrayRef>,
     },
 }
 

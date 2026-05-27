@@ -6085,6 +6085,50 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_batch_knn_flat_filter_keeps_non_vector_columns() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+        let k = 2;
+        let (queries, query_values) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        scan.use_index(false);
+        scan.filter("i >= 0").unwrap();
+        scan.project(&["i"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+
+        assert_query_index_field(&batch);
+        assert_batch_knn_output_has_no_vector(&batch);
+        assert!(batch.schema().column_with_name("i").is_some());
+
+        let query_indices = batch[QUERY_INDEX_COL].as_primitive::<Int32Type>();
+        for query_index in 0..2 {
+            let query =
+                Float32Array::from(query_values[query_index * 32..(query_index + 1) * 32].to_vec());
+            let mut single = dataset.scan();
+            single.nearest("vec", &query, k).unwrap();
+            single.use_index(false);
+            single.filter("i >= 0").unwrap();
+            single.project(&["i"]).unwrap();
+            let single_batch = single.try_into_batch().await.unwrap();
+
+            let mask = BooleanArray::from_iter(
+                query_indices
+                    .iter()
+                    .map(|value| value.map(|value| value == query_index as i32)),
+            );
+            let batch_slice = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
+            assert_eq!(
+                batch_slice["i"].as_primitive::<Int32Type>().values(),
+                single_batch["i"].as_primitive::<Int32Type>().values()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_primitive_query_length_multiple_of_dim_is_rejected() {
         let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
             .await
