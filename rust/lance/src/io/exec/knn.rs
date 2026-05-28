@@ -293,6 +293,44 @@ impl KNNVectorDistanceExec {
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 
+    fn resolve_vector_column(batch: &RecordBatch, column: &str) -> DataFusionResult<ArrayRef> {
+        if let Some(col) = batch.column_by_name(column) {
+            return Ok(col.clone());
+        }
+        let parts = lance_core::datatypes::parse_field_path(column).map_err(|e| {
+            DataFusionError::Internal(format!(
+                "batch KNN failed to parse vector column path '{column}': {e}"
+            ))
+        })?;
+        if parts.is_empty() {
+            return Err(DataFusionError::Internal(format!(
+                "batch KNN has invalid empty vector column path '{column}'"
+            )));
+        }
+        let mut current = batch.column_by_name(&parts[0]).cloned().ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "batch KNN expected vector column '{column}' in scan batch (missing root field '{}')",
+                parts[0]
+            ))
+        })?;
+        for part in &parts[1..] {
+            let struct_array = current
+                .as_any()
+                .downcast_ref::<arrow_array::StructArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "batch KNN expected struct while resolving '{column}', but parent of '{part}' was not a struct"
+                    ))
+                })?;
+            current = struct_array.column_by_name(part).cloned().ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "batch KNN expected vector column '{column}' in scan batch (missing nested field '{part}')"
+                ))
+            })?;
+        }
+        Ok(current)
+    }
+
     /// Create a new [`KNNVectorDistanceExec`] node.
     ///
     /// Returns an error if the preconditions are not met.
@@ -484,36 +522,97 @@ impl KNNVectorDistanceExec {
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 
+    fn build_struct_column_for_path(
+        field: &Field,
+        path: &[String],
+        leaf_column: ArrayRef,
+    ) -> DataFusionResult<ArrayRef> {
+        if path.is_empty() {
+            return Ok(leaf_column);
+        }
+        let DataType::Struct(children) = field.data_type() else {
+            return Err(DataFusionError::Internal(format!(
+                "batch KNN expected struct field '{}' while rebuilding nested vector path '{}'",
+                field.name(),
+                path.join(".")
+            )));
+        };
+        let mut columns = Vec::with_capacity(children.len());
+        for child in children.iter() {
+            if child.name() == &path[0] {
+                if path.len() == 1 {
+                    columns.push(leaf_column.clone());
+                } else {
+                    columns.push(Self::build_struct_column_for_path(
+                        child,
+                        &path[1..],
+                        leaf_column.clone(),
+                    )?);
+                }
+            } else {
+                columns.push(arrow_array::new_null_array(
+                    child.data_type(),
+                    leaf_column.len(),
+                ));
+            }
+        }
+        let struct_array = arrow_array::StructArray::try_new(children.clone(), columns, None)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        Ok(Arc::new(struct_array))
+    }
+
+    fn take_retained_vector_column(
+        results: &[BatchKnnCandidate],
+        field: &Field,
+        field_path: &[String],
+    ) -> DataFusionResult<ArrayRef> {
+        let vector_rows: Vec<&dyn Array> = results
+            .iter()
+            .map(|candidate| {
+                let BatchKnnExtra::WithSlimBatch {
+                    vector_row: Some(vector_row),
+                    ..
+                } = &candidate.extra
+                else {
+                    return Err(DataFusionError::Internal(
+                        "batch KNN expected vector rows in candidate heap".to_string(),
+                    ));
+                };
+                Ok(vector_row.as_ref())
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        let leaf_column = arrow::compute::concat(&vector_rows)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        if field_path.len() <= 1 {
+            Ok(leaf_column)
+        } else {
+            Self::build_struct_column_for_path(field, &field_path[1..], leaf_column)
+        }
+    }
+
     fn assemble_batch_output(
         results: &[BatchKnnCandidate],
         stored_schema: &Schema,
         column: &str,
+        retain_vector: bool,
     ) -> DataFusionResult<RecordBatch> {
+        let field_path = lance_core::datatypes::parse_field_path(column).map_err(|e| {
+            DataFusionError::Internal(format!(
+                "batch KNN failed to parse vector column path '{column}': {e}"
+            ))
+        })?;
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(stored_schema.fields().len());
         for field in stored_schema.fields() {
             if field.name() == ROW_ID {
                 let row_ids =
                     UInt64Array::from_iter(results.iter().map(|candidate| Some(candidate.row_id)));
                 columns.push(Arc::new(row_ids));
-            } else if field.name() == column {
-                let vector_rows: Vec<&dyn Array> = results
-                    .iter()
-                    .map(|candidate| {
-                        let BatchKnnExtra::WithSlimBatch {
-                            vector_row: Some(vector_row),
-                            ..
-                        } = &candidate.extra
-                        else {
-                            return Err(DataFusionError::Internal(
-                                "batch KNN expected vector rows in candidate heap".to_string(),
-                            ));
-                        };
-                        Ok(vector_row.as_ref())
-                    })
-                    .collect::<DataFusionResult<Vec<_>>>()?;
-                let vector_column = arrow::compute::concat(&vector_rows)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                columns.push(vector_column);
+            } else if retain_vector && !field_path.is_empty() && field.name() == &field_path[0] {
+                columns.push(Self::take_retained_vector_column(
+                    results,
+                    field,
+                    &field_path,
+                )?);
             } else {
                 columns.push(Self::take_slim_batch_field(results, field.name())?);
             }
@@ -563,16 +662,7 @@ impl KNNVectorDistanceExec {
 
             let mut slim_batch: Option<Arc<RecordBatch>> = None;
             let vectors = if retain_vector {
-                Some(
-                    batch
-                        .column_by_qualified_name(&column)
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(format!(
-                                "batch KNN expected vector column '{column}' in scan batch"
-                            ))
-                        })?
-                        .clone(),
-                )
+                Some(Self::resolve_vector_column(&batch, &column)?)
             } else {
                 None
             };
@@ -608,14 +698,7 @@ impl KNNVectorDistanceExec {
                     let extra = if retain_vector || needs_slim_batch {
                         let row_index = row_index as u32;
                         if slim_batch.is_none() {
-                            let should_drop_vector_from_slim =
-                                !retain_vector || !column.contains('.');
-                            let slim = if should_drop_vector_from_slim {
-                                Self::remove_vector_from_batch(&batch, &column)?
-                            } else {
-                                // keep nested projected vectors in slim batch until assembly supports nested reinsertion
-                                batch.clone()
-                            };
+                            let slim = Self::remove_vector_from_batch(&batch, &column)?;
                             slim_batch = Some(Arc::new(slim));
                         }
                         let slim_batch = slim_batch.as_ref().expect("slim batch");
@@ -673,7 +756,8 @@ impl KNNVectorDistanceExec {
             distances.append_value(result.distance);
         }
 
-        let output = Self::assemble_batch_output(&results, stored_schema.as_ref(), &column)?;
+        let output =
+            Self::assemble_batch_output(&results, stored_schema.as_ref(), &column, retain_vector)?;
 
         output
             .try_with_column_at(0, query_index_field(), Arc::new(query_indices.finish()))
@@ -2137,6 +2221,7 @@ mod tests {
     use arrow::datatypes::Float32Type;
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
+        StructArray,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use async_trait::async_trait;
@@ -2997,6 +3082,71 @@ mod tests {
             0,
             "take/copy should not retain row offset into the full input buffer"
         );
+    }
+
+    #[test]
+    fn test_resolve_vector_column_supports_escaped_nested_path() {
+        let vec_field = ArrowField::new(
+            "vec.with.dot",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                4,
+            ),
+            true,
+        );
+        let payload_field = ArrowField::new(
+            "payload",
+            DataType::Struct(vec![vec_field.clone()].into()),
+            true,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![payload_field]));
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..8).map(|v| v as f32).collect::<Vec<_>>()),
+            4,
+        )
+        .unwrap();
+        let payload = StructArray::from(vec![(Arc::new(vec_field), Arc::new(vectors) as ArrayRef)]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(payload)]).unwrap();
+        let vector =
+            KNNVectorDistanceExec::resolve_vector_column(&batch, "payload.`vec.with.dot`").unwrap();
+        assert_eq!(vector.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_vector_from_batch_nested_keeps_siblings() {
+        let vec_field = ArrowField::new(
+            "vec.with.dot",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                4,
+            ),
+            true,
+        );
+        let tag_field = ArrowField::new("tag", DataType::Utf8, true);
+        let payload_field = ArrowField::new(
+            "payload",
+            DataType::Struct(vec![vec_field.clone(), tag_field.clone()].into()),
+            true,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![payload_field]));
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..8).map(|v| v as f32).collect::<Vec<_>>()),
+            4,
+        )
+        .unwrap();
+        let tags = StringArray::from(vec!["a", "b"]);
+        let payload = StructArray::from(vec![
+            (Arc::new(vec_field), Arc::new(vectors) as ArrayRef),
+            (Arc::new(tag_field), Arc::new(tags) as ArrayRef),
+        ]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(payload)]).unwrap();
+
+        let slim =
+            KNNVectorDistanceExec::remove_vector_from_batch(&batch, "payload.`vec.with.dot`")
+                .unwrap();
+        let payload = slim.column_by_name("payload").unwrap().as_struct();
+        assert!(payload.column_by_name("vec.with.dot").is_none());
+        assert!(payload.column_by_name("tag").is_some());
     }
 
     #[tokio::test]
