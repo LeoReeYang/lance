@@ -217,6 +217,82 @@ impl DisplayAs for KNNVectorDistanceExec {
 }
 
 impl KNNVectorDistanceExec {
+    fn remove_field_path_from_fields(
+        fields: &[Arc<Field>],
+        path: &[String],
+    ) -> DataFusionResult<Vec<Arc<Field>>> {
+        if path.is_empty() {
+            return Ok(fields.to_vec());
+        }
+        let mut removed = false;
+        let mut new_fields = Vec::with_capacity(fields.len());
+        for field in fields {
+            if field.name() != &path[0] {
+                new_fields.push(field.clone());
+                continue;
+            }
+            removed = true;
+            if path.len() == 1 {
+                continue;
+            }
+            match field.data_type() {
+                DataType::Struct(children) => {
+                    let child_fields = children.iter().cloned().collect::<Vec<_>>();
+                    let projected_children =
+                        Self::remove_field_path_from_fields(&child_fields, &path[1..])?;
+                    if projected_children.is_empty() {
+                        continue;
+                    }
+                    let updated = Field::new(
+                        field.name(),
+                        DataType::Struct(projected_children.into()),
+                        field.is_nullable(),
+                    )
+                    .with_metadata(field.metadata().clone());
+                    new_fields.push(Arc::new(updated));
+                }
+                _ => {
+                    return Err(DataFusionError::Internal(format!(
+                        "batch KNN cannot remove nested path '{}': '{}' is not a struct",
+                        path.join("."),
+                        field.name()
+                    )));
+                }
+            }
+        }
+        if !removed {
+            return Err(DataFusionError::Internal(format!(
+                "batch KNN expected vector column '{}' in scan batch schema",
+                path.join(".")
+            )));
+        }
+        Ok(new_fields)
+    }
+
+    fn remove_vector_from_schema(schema: &Schema, column: &str) -> DataFusionResult<Schema> {
+        let path = lance_core::datatypes::parse_field_path(column).map_err(|err| {
+            DataFusionError::Internal(format!(
+                "batch KNN failed to parse vector column path '{column}': {err}"
+            ))
+        })?;
+        let fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+        let updated_fields = Self::remove_field_path_from_fields(&fields, &path)?;
+        Ok(Schema::new_with_metadata(
+            updated_fields,
+            schema.metadata().clone(),
+        ))
+    }
+
+    fn remove_vector_from_batch(
+        batch: &RecordBatch,
+        column: &str,
+    ) -> DataFusionResult<RecordBatch> {
+        let slim_schema = Self::remove_vector_from_schema(batch.schema().as_ref(), column)?;
+        batch
+            .project_by_schema(&slim_schema)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+
     /// Create a new [`KNNVectorDistanceExec`] node.
     ///
     /// Returns an error if the preconditions are not met.
@@ -292,7 +368,7 @@ impl KNNVectorDistanceExec {
         }
 
         let stored_schema = if is_batch && !retain_vector {
-            Arc::new(input_schema.without_column(column))
+            Arc::new(Self::remove_vector_from_schema(&input_schema, column)?)
         } else {
             Arc::new(input_schema)
         };
@@ -347,8 +423,10 @@ impl KNNVectorDistanceExec {
         })
     }
 
-    fn take_vector_row(vectors: &dyn Array, row_index: u32) -> ArrayRef {
-        vectors.slice(row_index as usize, 1)
+    fn take_vector_row(vectors: &dyn Array, row_index: u32) -> DataFusionResult<ArrayRef> {
+        let indices = UInt32Array::from_iter([Some(row_index)]);
+        arrow_select::take::take(vectors, &indices, None)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 
     fn take_slim_batch_field(
@@ -530,18 +608,22 @@ impl KNNVectorDistanceExec {
                     let extra = if retain_vector || needs_slim_batch {
                         let row_index = row_index as u32;
                         if slim_batch.is_none() {
-                            slim_batch = Some(Arc::new(
-                                batch
-                                    .drop_column(&column)
-                                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
-                            ));
+                            let should_drop_vector_from_slim =
+                                !retain_vector || !column.contains('.');
+                            let slim = if should_drop_vector_from_slim {
+                                Self::remove_vector_from_batch(&batch, &column)?
+                            } else {
+                                // keep nested projected vectors in slim batch until assembly supports nested reinsertion
+                                batch.clone()
+                            };
+                            slim_batch = Some(Arc::new(slim));
                         }
                         let slim_batch = slim_batch.as_ref().expect("slim batch");
                         let vector_row = if retain_vector {
                             Some(Self::take_vector_row(
                                 vectors.as_ref().expect("vectors"),
                                 row_index,
-                            ))
+                            )?)
                         } else {
                             None
                         };
@@ -734,35 +816,41 @@ impl ExecutionPlan for KNNVectorDistanceExec {
 
     fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
         let inner_stats = self.input.partition_statistics(partition)?;
-        let schema = self.input.schema();
-        let dist_stats = inner_stats
+        let input_schema = self.input.schema();
+        let input_stats_by_name = inner_stats
             .column_statistics
             .iter()
-            .zip(schema.fields())
-            .find(|(_, field)| field.name() == &self.column)
-            .map(|(stats, _)| ColumnStatistics {
+            .zip(input_schema.fields())
+            .map(|(stats, field)| (field.name().as_str(), stats.clone()))
+            .collect::<HashMap<_, _>>();
+        let vector_root = lance_core::datatypes::parse_field_path(&self.column)
+            .ok()
+            .and_then(|parts| parts.first().cloned())
+            .unwrap_or_else(|| self.column.clone());
+        let dist_stats = input_stats_by_name
+            .get(vector_root.as_str())
+            .map(|stats| ColumnStatistics {
                 null_count: stats.null_count,
                 ..Default::default()
             })
             .unwrap_or_default();
-        let column_statistics = inner_stats
-            .column_statistics
-            .into_iter()
-            .zip(schema.fields())
-            .filter(|(_, field)| field.name() != DIST_COL)
-            .map(|(stats, _)| stats)
+        let column_statistics = self
+            .output_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == QUERY_INDEX_COL {
+                    ColumnStatistics::default()
+                } else if field.name() == DIST_COL {
+                    dist_stats.clone()
+                } else {
+                    input_stats_by_name
+                        .get(field.name().as_str())
+                        .cloned()
+                        .unwrap_or_default()
+                }
+            })
             .collect::<Vec<_>>();
-        let column_statistics = if self.is_batch {
-            std::iter::once(ColumnStatistics::default())
-                .chain(column_statistics)
-                .chain(std::iter::once(dist_stats))
-                .collect::<Vec<_>>()
-        } else {
-            column_statistics
-                .into_iter()
-                .chain(std::iter::once(dist_stats))
-                .collect::<Vec<_>>()
-        };
         Ok(Statistics {
             num_rows: inner_stats.num_rows,
             column_statistics,
@@ -2799,6 +2887,115 @@ mod tests {
                 ArrowField::new("uri", DataType::Utf8, true),
                 ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
+        );
+    }
+
+    #[test]
+    fn test_batch_partition_statistics_aligns_with_output_schema() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    4,
+                ),
+                true,
+            ),
+            ROW_ID_FIELD.clone(),
+        ]));
+        let batch = RecordBatch::new_empty(schema);
+        let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch]));
+        let query = Arc::new(Float32Array::from(vec![0.0, 1.0, 2.0, 3.0])) as ArrayRef;
+        let plan = KNNVectorDistanceExec::try_new_batch(
+            input,
+            "vec",
+            query,
+            KnnBatchParams {
+                is_batch: true,
+                query_count: 1,
+                k: 2,
+                lower_bound: None,
+                upper_bound: None,
+                distance_type: DistanceType::L2,
+                retain_vector: false,
+            },
+        )
+        .unwrap();
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(
+            stats.column_statistics.len(),
+            plan.schema().fields().len(),
+            "partition stats must align with output schema"
+        );
+        let schema = plan.schema();
+        let query_index_pos = schema
+            .column_with_name(QUERY_INDEX_COL)
+            .expect("query_index must exist")
+            .0;
+        let dist_pos = schema
+            .column_with_name(DIST_COL)
+            .expect("distance must exist")
+            .0;
+        assert_eq!(
+            stats.column_statistics[query_index_pos],
+            ColumnStatistics::default(),
+        );
+        assert_eq!(
+            stats.column_statistics[dist_pos].null_count,
+            stats.column_statistics[schema.column_with_name("i").unwrap().0].null_count,
+            "distance null-count should be derived from vector/input nullability and remain aligned"
+        );
+    }
+
+    #[test]
+    fn test_remove_vector_from_schema_nested_path() {
+        let payload_field = ArrowField::new(
+            "payload",
+            DataType::Struct(
+                vec![
+                    ArrowField::new(
+                        "vec",
+                        DataType::FixedSizeList(
+                            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                            4,
+                        ),
+                        true,
+                    ),
+                    ArrowField::new("tag", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            payload_field,
+            ROW_ID_FIELD.clone(),
+        ]);
+        let without_vec =
+            KNNVectorDistanceExec::remove_vector_from_schema(&schema, "payload.vec").unwrap();
+        let payload = without_vec.field_with_name("payload").unwrap();
+        let DataType::Struct(children) = payload.data_type() else {
+            panic!("payload should remain struct");
+        };
+        assert!(children.iter().all(|f| f.name() != "vec"));
+        assert!(children.iter().any(|f| f.name() == "tag"));
+    }
+
+    #[test]
+    fn test_take_vector_row_copies_single_row() {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..12).map(|v| v as f32).collect::<Vec<_>>()),
+            4,
+        )
+        .unwrap();
+        let row = KNNVectorDistanceExec::take_vector_row(&vectors, 2).unwrap();
+        assert_eq!(row.len(), 1);
+        assert_eq!(
+            row.to_data().offset(),
+            0,
+            "take/copy should not retain row offset into the full input buffer"
         );
     }
 
