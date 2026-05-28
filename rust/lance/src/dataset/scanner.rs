@@ -6215,6 +6215,35 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_batch_knn_flat_projects_row_id_and_row_addr_without_vector() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+        let k = 2;
+        let (queries, _) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        scan.use_index(false);
+        scan.project(&[ROW_ID]).unwrap();
+        scan.with_row_address();
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        assert_batch_knn_output_has_no_vector(&batch, "vec");
+        assert_eq!(batch.num_rows(), 2 * k);
+        assert!(batch.schema().column_with_name(ROW_ID).is_some());
+        assert!(batch.schema().column_with_name(ROW_ADDR).is_some());
+        assert!(batch.schema().column_with_name(DIST_COL).is_some());
+        assert_eq!(
+            batch[ROW_ADDR].as_primitive::<UInt64Type>().null_count(),
+            0,
+            "row addresses should be materialized for all top-k rows"
+        );
+    }
+
+    #[tokio::test]
     async fn test_primitive_query_length_multiple_of_dim_is_rejected() {
         let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
             .await
