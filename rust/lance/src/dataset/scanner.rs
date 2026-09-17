@@ -3005,13 +3005,19 @@ impl Scanner {
             // If there is ordering, we can't pushdown limit / offset
             // because we need to sort all data first before applying the limit
             Ok(None)
-        } else if self.dataset.manifest.uses_stable_row_ids() {
-            // Stable-row-id datasets can contain deleted / rewritten rows that still occupy
-            // physical positions in older fragments while the live replacement rows are appended
-            // to new fragments. `scan_range_before_filter` is a logical offset over visible rows,
-            // but filtered-read planning trims fragments before the stable-row-id/deletion-aware
-            // remapping is finished. Pushing limit / offset down here can spend the range on
-            // tombstoned positions and skip still-live rows in later fragments.
+        } else if self.dataset.manifest.uses_stable_row_ids()
+            && self
+                .fragments
+                .as_deref()
+                .unwrap_or_else(|| self.dataset.fragments())
+                .iter()
+                .any(|fragment| fragment.deletion_file.is_some())
+        {
+            // Stable-row-id datasets with deletions contain physical positions that are not
+            // visible rows. Filtered-read planning trims fragments before applying deletion
+            // vectors, so pushing down a logical limit / offset could spend the range on
+            // tombstones and skip live rows in later fragments. Without deletion files every
+            // physical position in the scan is visible, so the range is safe to push down.
             Ok(None)
         } else {
             match (self.limit, self.offset) {
@@ -9190,6 +9196,34 @@ mod test {
             let actual = scan.limit(Some(0), None)?.try_into_batch().await?;
             assert_eq!(actual.num_rows(), 0);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_id_limit_pushdown_guarded_by_deletions() -> Result<()> {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true).await?;
+        let mut dataset = test_ds.dataset;
+
+        {
+            let mut scan = dataset.scan();
+            scan.limit(Some(2), Some(19))?;
+
+            assert_eq!(
+                scan.get_scan_range(&ExprFilterPlan::default()).await?,
+                Some(19..21)
+            );
+        }
+
+        dataset.delete("i = 0").await?;
+        let mut scan = dataset.scan();
+        scan.limit(Some(2), Some(19))?;
+
+        assert_eq!(scan.get_scan_range(&ExprFilterPlan::default()).await?, None);
+
+        let expected = dataset.scan().try_into_batch().await?.slice(19, 2);
+        let actual = scan.try_into_batch().await?;
+        assert_eq!(actual, expected);
+
         Ok(())
     }
 
