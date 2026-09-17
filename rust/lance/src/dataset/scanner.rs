@@ -3015,18 +3015,8 @@ impl Scanner {
         Some(start..end)
     }
 
-    fn plan_deletion_aware_scan_range(&self) -> Option<ScanRangePlan> {
-        if self.include_deleted_rows
-            || self.dataset.manifest().writer_version.is_none()
-            || self
-                .dataset
-                .manifest()
-                .data_storage_format
-                .lance_file_format()
-                == lance_file::version::ConcreteFileVersion::V1
-        {
-            return None;
-        }
+    fn plan_metadata_scan_range(&self) -> Option<ScanRangePlan> {
+        self.dataset.manifest().writer_version.as_ref()?;
 
         let fragments = self
             .fragments
@@ -3085,19 +3075,35 @@ impl Scanner {
         } else if self.include_deleted_rows || (self.limit.is_none() && self.offset.is_none()) {
             // FilteredReadOptions does not support scan ranges when deleted rows are included.
             Ok(None)
-        } else if self.dataset.manifest.uses_stable_row_ids()
-            && self
+        } else {
+            let fragments = self
                 .fragments
                 .as_deref()
-                .unwrap_or_else(|| self.dataset.fragments())
+                .unwrap_or_else(|| self.dataset.fragments());
+            let has_deletions = fragments
                 .iter()
-                .any(|fragment| fragment.deletion_file.is_some())
-        {
-            // Current-format filtered reads can exactly trim a logical range after loading the
-            // retained deletion vectors. Manifest counts first remove whole fragments, then the
-            // residual range is interpreted relative to the first retained fragment.
-            Ok(self.plan_deletion_aware_scan_range())
-        } else {
+                .any(|fragment| fragment.deletion_file.is_some());
+            let is_v1 = self
+                .dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_format()
+                == lance_file::version::ConcreteFileVersion::V1;
+
+            // V2 range planning is independent of row-ID encoding. Manifest live-row counts
+            // remove whole fragments first; filtered read loads deletion vectors only for the
+            // retained fragments and trims the residual logical range inside them.
+            if !is_v1 && let Some(plan) = self.plan_metadata_scan_range() {
+                return Ok(Some(plan));
+            }
+
+            // Keep V1 behavior unchanged. For V2 fragments with deletions, incomplete metadata
+            // cannot safely locate the requested visible ordinals, so retain the non-pushdown
+            // fallback instead of guessing.
+            if has_deletions && (!is_v1 || self.dataset.manifest().uses_stable_row_ids()) {
+                return Ok(None);
+            }
+
             let total_rows = u64::try_from(self.dataset.count_all_rows().await?).map_err(|_| {
                 Error::internal("Dataset row count does not fit in u64".to_string())
             })?;
@@ -9298,6 +9304,47 @@ mod test {
         Ok(())
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn test_v2_limit_pushdown_correctness(
+        #[values(false, true)] stable_row_ids: bool,
+        #[values(false, true)] with_deletions: bool,
+    ) -> Result<()> {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(4),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_stable_row_ids: stable_row_ids,
+                    data_storage_version: Some(LanceFileVersion::Stable),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        if with_deletions {
+            dataset.delete("idx % 10 = 0").await?;
+        }
+
+        for (offset, limit) in [
+            (0, 5),
+            (8, 8),
+            (9, 3),
+            (17, 10),
+            (35, 10),
+            (100, 5),
+            (15, 0),
+        ] {
+            assert_scan_slice_matches(&dataset, None, offset, limit).await?;
+        }
+
+        let fragments = dataset.fragments();
+        let reordered = vec![fragments[3].clone(), fragments[1].clone()];
+        assert_scan_slice_matches(&dataset, Some(&reordered), 8, 10).await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_stable_row_id_limit_pushdown_with_deletions() -> Result<()> {
         let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true).await?;
@@ -9474,8 +9521,12 @@ mod test {
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_stable_row_id_limit_pushdown_prunes_fragments() -> Result<()> {
+    async fn test_v2_limit_pushdown_prunes_fragments(
+        #[values(false, true)] stable_row_ids: bool,
+        #[values(false, true)] with_deletions: bool,
+    ) -> Result<()> {
         let mut dataset = lance_datagen::gen_batch()
             .col("idx", array::step::<Int32Type>())
             .into_ram_dataset_with_params(
@@ -9483,17 +9534,22 @@ mod test {
                 FragmentRowCount::from(10),
                 Some(WriteParams {
                     max_rows_per_file: 10,
-                    enable_stable_row_ids: true,
+                    enable_stable_row_ids: stable_row_ids,
                     data_storage_version: Some(LanceFileVersion::Stable),
                     ..Default::default()
                 }),
             )
             .await?;
-        dataset.delete("idx IN (0, 100, 200, 300)").await?;
+        let offset = if with_deletions {
+            dataset.delete("idx % 10 = 0").await?;
+            25 * 9
+        } else {
+            25 * 10
+        };
 
         let candidate_fragments = dataset.fragments().len();
         let mut scan = dataset.scan();
-        scan.limit(Some(3), Some(250))?;
+        scan.limit(Some(3), Some(offset))?;
         let plan = scan.create_plan().await?;
         let filtered = find_filtered_read(plan.as_ref()).expect("filtered read");
         let planned_fragments = filtered
@@ -9505,7 +9561,7 @@ mod test {
 
         assert_eq!(candidate_fragments, 32);
         assert_eq!(planned_fragments, 1);
-        assert_scan_slice_matches(&dataset, None, 250, 3).await?;
+        assert_scan_slice_matches(&dataset, None, offset as usize, 3).await?;
         Ok(())
     }
 
