@@ -768,7 +768,23 @@ impl FilteredReadStream {
                     } else {
                         (load_row_id_sequence(dataset.as_ref(), &frag).await?, None)
                     };
-                let num_logical_rows = row_id_sequence.len();
+                let num_deleted_rows = deletion_vector
+                    .as_ref()
+                    .map_or(0_u64, |deletion_vector| deletion_vector.len() as u64);
+                // Stable row IDs describe physical slots, including tombstoned slots. Scan ranges
+                // use visible ordinals, so the logical count must exclude the loaded deletions.
+                let num_logical_rows =
+                    num_physical_rows
+                        .checked_sub(num_deleted_rows)
+                        .ok_or_else(|| {
+                            Error::corrupt_file(
+                                dataset.base.clone(),
+                                format!(
+                                    "Fragment {} has {} physical rows but {} deleted rows",
+                                    frag.id, num_physical_rows, num_deleted_rows
+                                ),
+                            )
+                        })?;
                 (row_id_sequence, num_logical_rows, index_upper_ranges)
             } else {
                 debug_assert!(stable_index_routing.is_none());

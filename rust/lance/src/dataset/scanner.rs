@@ -638,6 +638,12 @@ pub(super) struct PlannedFilteredScan {
     pub(super) filter_pushed_down: bool,
 }
 
+#[derive(Debug)]
+struct ScanRangePlan {
+    fragments: Option<Arc<Vec<Fragment>>>,
+    range: Range<u64>,
+}
+
 pub struct FilterPlan {
     // Query filter plan
     query_filter: Option<QueryFilter>,
@@ -2997,13 +3003,87 @@ impl Scanner {
         Ok(filter_plan)
     }
 
-    async fn get_scan_range(&self, filter_plan: &ExprFilterPlan) -> Result<Option<Range<u64>>> {
+    fn requested_scan_range(&self, total_rows: u64) -> Option<Range<u64>> {
+        let offset = u64::try_from(self.offset.unwrap_or(0)).ok()?;
+        let start = offset.min(total_rows);
+        let end = match self.limit {
+            Some(limit) => offset
+                .checked_add(u64::try_from(limit).ok()?)?
+                .min(total_rows),
+            None => total_rows,
+        };
+        Some(start..end)
+    }
+
+    fn plan_deletion_aware_scan_range(&self) -> Option<ScanRangePlan> {
+        if self.include_deleted_rows
+            || self.dataset.manifest().writer_version.is_none()
+            || self
+                .dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_format()
+                == lance_file::version::ConcreteFileVersion::V1
+        {
+            return None;
+        }
+
+        let fragments = self
+            .fragments
+            .as_deref()
+            .unwrap_or_else(|| self.dataset.fragments());
+        let mut visible_prefix = Vec::with_capacity(fragments.len() + 1);
+        visible_prefix.push(0_u64);
+
+        for fragment in fragments {
+            // Metadata-only pruning is an optimization. Any missing or inconsistent count must
+            // preserve the unpruned path instead of guessing where a visible ordinal lands.
+            let physical_rows = u64::try_from(fragment.physical_rows?).ok()?;
+            let deleted_rows = match fragment.deletion_file.as_ref() {
+                Some(deletion_file) => u64::try_from(deletion_file.num_deleted_rows?).ok()?,
+                None => 0,
+            };
+            let visible_rows = physical_rows.checked_sub(deleted_rows)?;
+            visible_prefix.push(visible_prefix.last()?.checked_add(visible_rows)?);
+        }
+
+        let requested_range = self.requested_scan_range(*visible_prefix.last()?)?;
+        let start = requested_range.start;
+        let end = requested_range.end;
+
+        if start == end {
+            return Some(ScanRangePlan {
+                fragments: Some(Arc::new(Vec::new())),
+                range: 0..0,
+            });
+        }
+
+        let first_fragment = visible_prefix
+            .windows(2)
+            .position(|window| window[1] > start)?;
+        let final_visible_ordinal = end.checked_sub(1)?;
+        let last_fragment = visible_prefix
+            .windows(2)
+            .position(|window| window[1] > final_visible_ordinal)?;
+        let visible_before_first = visible_prefix[first_fragment];
+        let selected_fragments = fragments[first_fragment..=last_fragment].to_vec();
+        Some(ScanRangePlan {
+            fragments: Some(Arc::new(selected_fragments)),
+            range: start.checked_sub(visible_before_first)?
+                ..end.checked_sub(visible_before_first)?,
+        })
+    }
+
+    async fn plan_scan_range(&self, filter_plan: &ExprFilterPlan) -> Result<Option<ScanRangePlan>> {
         if filter_plan.has_any_filter() {
             // If there is a filter we can't pushdown limit / offset
             Ok(None)
         } else if self.ordering.is_some() {
             // If there is ordering, we can't pushdown limit / offset
             // because we need to sort all data first before applying the limit
+            Ok(None)
+        } else if self.include_deleted_rows || (self.limit.is_none() && self.offset.is_none()) {
+            // FilteredReadOptions does not support scan ranges when deleted rows are included.
             Ok(None)
         } else if self.dataset.manifest.uses_stable_row_ids()
             && self
@@ -3013,30 +3093,20 @@ impl Scanner {
                 .iter()
                 .any(|fragment| fragment.deletion_file.is_some())
         {
-            // Stable-row-id datasets with deletions contain physical positions that are not
-            // visible rows. Filtered-read planning trims fragments before applying deletion
-            // vectors, so pushing down a logical limit / offset could spend the range on
-            // tombstones and skip live rows in later fragments. Without deletion files every
-            // physical position in the scan is visible, so the range is safe to push down.
-            Ok(None)
+            // Current-format filtered reads can exactly trim a logical range after loading the
+            // retained deletion vectors. Manifest counts first remove whole fragments, then the
+            // residual range is interpreted relative to the first retained fragment.
+            Ok(self.plan_deletion_aware_scan_range())
         } else {
-            match (self.limit, self.offset) {
-                (None, None) => Ok(None),
-                (Some(limit), None) => {
-                    let num_rows = self.dataset.count_all_rows().await? as i64;
-                    Ok(Some(0..limit.min(num_rows) as u64))
-                }
-                (None, Some(offset)) => {
-                    let num_rows = self.dataset.count_all_rows().await? as i64;
-                    Ok(Some(offset.min(num_rows) as u64..num_rows as u64))
-                }
-                (Some(limit), Some(offset)) => {
-                    let num_rows = self.dataset.count_all_rows().await? as i64;
-                    Ok(Some(
-                        offset.min(num_rows) as u64..(offset + limit).min(num_rows) as u64,
-                    ))
-                }
-            }
+            let total_rows = u64::try_from(self.dataset.count_all_rows().await?).map_err(|_| {
+                Error::internal("Dataset row count does not fit in u64".to_string())
+            })?;
+            Ok(self
+                .requested_scan_range(total_rows)
+                .map(|range| ScanRangePlan {
+                    fragments: self.fragments.clone().map(Arc::new),
+                    range,
+                }))
         }
     }
 
@@ -3752,18 +3822,22 @@ impl Scanner {
         // limit/offset must not be pushed down as a pre-mask range (that would limit
         // rows before masking). Leaving scan_range None keeps limit_pushed_down false
         // so the limit is applied by a node above the masked source instead.
-        let scan_range = if filter_plan.is_empty() && !self.use_external_mask() {
+        let scan_range_plan = if filter_plan.is_empty() && !self.use_external_mask() {
             log::trace!("pushing scan_range into filtered_read");
-            self.get_scan_range(filter_plan).await?
+            self.plan_scan_range(filter_plan).await?
         } else {
             None
+        };
+        let (fragments, scan_range) = match scan_range_plan {
+            Some(plan) => (plan.fragments, Some(plan.range)),
+            None => (self.fragments.clone().map(Arc::new), None),
         };
 
         self.filtered_read(
             filter_plan,
             projection,
             self.include_deleted_rows,
-            self.fragments.clone().map(Arc::new),
+            fragments,
             scan_range,
             /*is_prefilter= */ false,
             session,
@@ -9199,30 +9273,275 @@ mod test {
         Ok(())
     }
 
+    async fn assert_scan_slice_matches(
+        dataset: &Dataset,
+        fragments: Option<&[Fragment]>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<()> {
+        let mut full_scan = dataset.scan();
+        if let Some(fragments) = fragments {
+            full_scan.with_fragments(fragments.to_vec());
+        }
+        let full = full_scan.try_into_batch().await?;
+        let expected_offset = offset.min(full.num_rows());
+        let expected_len = limit.min(full.num_rows() - expected_offset);
+        let expected = full.slice(expected_offset, expected_len);
+
+        let mut scan = dataset.scan();
+        if let Some(fragments) = fragments {
+            scan.with_fragments(fragments.to_vec());
+        }
+        scan.limit(Some(limit as i64), Some(offset as i64))?;
+        let actual = scan.try_into_batch().await?;
+        assert_eq!(actual, expected, "offset={offset}, limit={limit}");
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn test_stable_row_id_limit_pushdown_guarded_by_deletions() -> Result<()> {
+    async fn test_stable_row_id_limit_pushdown_with_deletions() -> Result<()> {
         let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true).await?;
         let mut dataset = test_ds.dataset;
 
-        {
-            let mut scan = dataset.scan();
-            scan.limit(Some(2), Some(19))?;
-
-            assert_eq!(
-                scan.get_scan_range(&ExprFilterPlan::default()).await?,
-                Some(19..21)
-            );
-        }
-
-        dataset.delete("i = 0").await?;
+        assert_scan_slice_matches(&dataset, None, 19, 2).await?;
         let mut scan = dataset.scan();
         scan.limit(Some(2), Some(19))?;
+        let scan_range_plan = scan
+            .plan_scan_range(&ExprFilterPlan::default())
+            .await?
+            .expect("scan range");
+        assert_eq!(scan_range_plan.range, 19..21);
 
-        assert_eq!(scan.get_scan_range(&ExprFilterPlan::default()).await?, None);
+        dataset
+            .delete("i IN (0, 20, 25, 198, 200, 205, 399)")
+            .await?;
 
-        let expected = dataset.scan().try_into_batch().await?.slice(19, 2);
-        let actual = scan.try_into_batch().await?;
-        assert_eq!(actual, expected);
+        // Deletions before OFFSET, within the boundary fragment, at the LIMIT endpoint,
+        // and a LIMIT spanning fragments all match full-scan slice semantics.
+        for (offset, limit) in [
+            (0, 10),
+            (19, 2),
+            (20, 10),
+            (190, 20),
+            (196, 10),
+            (200, 10),
+            (390, 10),
+            (500, 10),
+            (196, 0),
+        ] {
+            assert_scan_slice_matches(&dataset, None, offset, limit).await?;
+        }
+
+        // Fragment 0 has 196 visible rows, so an offset on that exact boundary can
+        // discard it and express the remaining range relative to fragment 1.
+        let mut scan = dataset.scan();
+        scan.limit(Some(10), Some(196))?;
+        let scan_range_plan = scan
+            .plan_scan_range(&ExprFilterPlan::default())
+            .await?
+            .expect("scan range");
+        assert_eq!(scan_range_plan.range, 0..10);
+        let plan = scan.create_plan().await?;
+        let filtered = find_filtered_read(plan.as_ref()).expect("filtered read");
+        let selected = filtered
+            .options()
+            .fragments
+            .as_ref()
+            .expect("pruned fragments");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, 1);
+
+        // Explicit fragment subsets and order define scan order; stable row IDs need not be
+        // contiguous or increasing.
+        let fragments = dataset.fragments().as_ref().clone();
+        assert_scan_slice_matches(&dataset, Some(&fragments[1..]), 10, 10).await?;
+        let reversed = vec![fragments[1].clone(), fragments[0].clone()];
+        assert_scan_slice_matches(&dataset, Some(&reversed), 197, 10).await?;
+        let mut reversed_scan = dataset.scan();
+        reversed_scan.with_fragments(reversed);
+        reversed_scan.limit(Some(10), Some(197))?;
+        let reversed_plan = reversed_scan.create_plan().await?;
+        let filtered = find_filtered_read(reversed_plan.as_ref()).expect("filtered read");
+        let selected = filtered
+            .options()
+            .fragments
+            .as_ref()
+            .expect("pruned fragments");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, 0);
+
+        // A zero-live-row fragment does not consume visible ordinals and can be pruned.
+        let mut fully_deleted = fragments[0].clone();
+        let physical_rows = fully_deleted.physical_rows;
+        fully_deleted
+            .deletion_file
+            .as_mut()
+            .expect("deletion file")
+            .num_deleted_rows = physical_rows;
+        let mut fully_deleted_scan = dataset.scan();
+        fully_deleted_scan.with_fragments(vec![fully_deleted, fragments[1].clone()]);
+        fully_deleted_scan.limit(Some(10), Some(0))?;
+        let fully_deleted_plan = fully_deleted_scan
+            .plan_scan_range(&ExprFilterPlan::default())
+            .await?
+            .expect("scan range");
+        assert_eq!(fully_deleted_plan.range, 0..10);
+        assert_eq!(
+            fully_deleted_plan.fragments.expect("pruned fragments")[0].id,
+            1
+        );
+
+        // Unknown or inconsistent metadata conservatively preserves the fallback.
+        let mut unknown_count = dataset.fragments()[0].clone();
+        unknown_count
+            .deletion_file
+            .as_mut()
+            .expect("deletion file")
+            .num_deleted_rows = None;
+        let mut unknown_scan = dataset.scan();
+        unknown_scan.with_fragments(vec![unknown_count]);
+        unknown_scan.limit(Some(10), Some(1))?;
+        assert!(
+            unknown_scan
+                .plan_scan_range(&ExprFilterPlan::default())
+                .await?
+                .is_none()
+        );
+
+        let mut missing_physical_rows = dataset.fragments()[0].clone();
+        missing_physical_rows.physical_rows = None;
+        let mut missing_rows_scan = dataset.scan();
+        missing_rows_scan.with_fragments(vec![missing_physical_rows]);
+        missing_rows_scan.limit(Some(10), Some(1))?;
+        assert!(
+            missing_rows_scan
+                .plan_scan_range(&ExprFilterPlan::default())
+                .await?
+                .is_none()
+        );
+
+        let mut invalid_deleted_rows = dataset.fragments()[0].clone();
+        let physical_rows = invalid_deleted_rows.physical_rows.expect("physical rows");
+        invalid_deleted_rows
+            .deletion_file
+            .as_mut()
+            .expect("deletion file")
+            .num_deleted_rows = physical_rows.checked_add(1);
+        let mut invalid_rows_scan = dataset.scan();
+        invalid_rows_scan.with_fragments(vec![invalid_deleted_rows]);
+        invalid_rows_scan.limit(Some(10), Some(1))?;
+        assert!(
+            invalid_rows_scan
+                .plan_scan_range(&ExprFilterPlan::default())
+                .await?
+                .is_none()
+        );
+
+        let mut include_deleted_scan = dataset.scan();
+        include_deleted_scan.with_row_id().include_deleted_rows();
+        include_deleted_scan.limit(Some(10), Some(1))?;
+        assert!(
+            include_deleted_scan
+                .plan_scan_range(&ExprFilterPlan::default())
+                .await?
+                .is_none()
+        );
+
+        let mut untrusted_dataset = dataset.clone();
+        Arc::make_mut(&mut untrusted_dataset.manifest).writer_version = None;
+        let mut untrusted_scan = untrusted_dataset.scan();
+        untrusted_scan.limit(Some(10), Some(1))?;
+        assert!(
+            untrusted_scan
+                .plan_scan_range(&ExprFilterPlan::default())
+                .await?
+                .is_none()
+        );
+
+        let legacy_test_ds = TestVectorDataset::new(LanceFileVersion::Legacy, true).await?;
+        let mut legacy_dataset = legacy_test_ds.dataset;
+        legacy_dataset.delete("i = 0").await?;
+        let mut legacy_scan = legacy_dataset.scan();
+        legacy_scan.limit(Some(10), Some(1))?;
+        assert!(
+            legacy_scan
+                .plan_scan_range(&ExprFilterPlan::default())
+                .await?
+                .is_none()
+        );
+        assert_scan_slice_matches(&legacy_dataset, None, 1, 10).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_id_limit_pushdown_prunes_fragments() -> Result<()> {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(32),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_stable_row_ids: true,
+                    data_storage_version: Some(LanceFileVersion::Stable),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        dataset.delete("idx IN (0, 100, 200, 300)").await?;
+
+        let candidate_fragments = dataset.fragments().len();
+        let mut scan = dataset.scan();
+        scan.limit(Some(3), Some(250))?;
+        let plan = scan.create_plan().await?;
+        let filtered = find_filtered_read(plan.as_ref()).expect("filtered read");
+        let planned_fragments = filtered
+            .options()
+            .fragments
+            .as_ref()
+            .expect("pruned fragments")
+            .len();
+
+        assert_eq!(candidate_fragments, 32);
+        assert_eq!(planned_fragments, 1);
+        assert_scan_slice_matches(&dataset, None, 250, 3).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_id_limit_pushdown_after_update() -> Result<()> {
+        let dataset = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(3),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_stable_row_ids: true,
+                    data_storage_version: Some(LanceFileVersion::Stable),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        let dataset = crate::dataset::UpdateBuilder::new(Arc::new(dataset))
+            .update_where("idx IN (1, 11, 21)")?
+            .set("idx", "idx + 1000")?
+            .build()?
+            .execute()
+            .await?
+            .new_dataset;
+        let mut dataset =
+            Arc::try_unwrap(dataset).unwrap_or_else(|dataset| dataset.as_ref().clone());
+
+        for (offset, limit) in [(0, 5), (8, 8), (18, 8), (27, 3)] {
+            assert_scan_slice_matches(&dataset, None, offset, limit).await?;
+        }
+
+        compact_files(&mut dataset, CompactionOptions::default(), None).await?;
+        for (offset, limit) in [(0, 5), (8, 8), (18, 8), (27, 3)] {
+            assert_scan_slice_matches(&dataset, None, offset, limit).await?;
+        }
 
         Ok(())
     }
