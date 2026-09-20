@@ -25,6 +25,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_io::ReadBatchParams;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::pb;
 use lance_table::rowids::FragmentRowIdIndex;
 use lance_table::{
@@ -529,17 +530,112 @@ fn bench_shot_table(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_mask_to_offset_ranges(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mask_to_offset_ranges");
+    group.sample_size(20);
+    group.warm_up_time(std::time::Duration::from_millis(300));
+    group.measurement_time(std::time::Duration::from_secs(2));
+
+    for span in [100_000_u64, 1_000_000] {
+        let live: Vec<u64> = (0..span).filter(|id| id % 17 != 0).collect();
+        let sequence = RowIdSequence::from(live.as_slice());
+        let range_sequence = RowIdSequence::from(0..span);
+        assert!(matches!(
+            sequence.segments(),
+            [lance_table::rowids::segment::U64Segment::RangeWithBitmap { .. }]
+        ));
+
+        for hits in [1_usize, 10, 1_000, live.len()] {
+            let ids: Vec<u64> = if hits == live.len() {
+                live.clone()
+            } else {
+                (0..hits)
+                    .map(|index| live[(index + 1) * (live.len() - 1) / hits])
+                    .collect()
+            };
+            let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(ids.as_slice()));
+            let name = if hits == live.len() {
+                "all".to_string()
+            } else {
+                hits.to_string()
+            };
+            group.bench_with_input(
+                BenchmarkId::new(span.to_string(), name),
+                &mask,
+                |b, mask| {
+                    b.iter(|| std::hint::black_box(sequence.mask_to_offset_ranges(mask)));
+                },
+            );
+            let range_name = if hits == live.len() {
+                "range-all".to_string()
+            } else {
+                format!("range-{hits}")
+            };
+            group.bench_with_input(
+                BenchmarkId::new(span.to_string(), range_name),
+                &mask,
+                |b, mask| {
+                    b.iter(|| std::hint::black_box(range_sequence.mask_to_offset_ranges(mask)));
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+fn bench_bitmap_mask_density(c: &mut Criterion) {
+    let span = 1_000_000_u64;
+    let live: Vec<u64> = (0..span).filter(|id| id % 17 != 0).collect();
+    let sequence = RowIdSequence::from(live.as_slice());
+    assert!(matches!(
+        sequence.segments(),
+        [lance_table::rowids::segment::U64Segment::RangeWithBitmap { .. }]
+    ));
+
+    let mut group = c.benchmark_group("bitmap_mask_density");
+    group.sample_size(15);
+    group.warm_up_time(std::time::Duration::from_millis(250));
+    group.measurement_time(std::time::Duration::from_secs(1));
+    for hits in [
+        1_usize,
+        1_000,
+        10_000,
+        20_000,
+        50_000,
+        100_000,
+        200_000,
+        400_000,
+        800_000,
+        live.len(),
+    ] {
+        let ids: Vec<u64> = if hits == live.len() {
+            live.clone()
+        } else {
+            (0..hits)
+                .map(|index| live[(index + 1) * (live.len() - 1) / hits])
+                .collect()
+        };
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(ids.as_slice()));
+        group.bench_with_input(BenchmarkId::from_parameter(hits), &mask, |b, mask| {
+            b.iter(|| std::hint::black_box(sequence.mask_to_offset_ranges(mask)));
+        });
+    }
+    group.finish();
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name = benches;
     config=Criterion::default().with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
-    targets=bench_creation, bench_get_single, bench_apply_row_id, bench_shot_table);
+    targets=bench_creation, bench_get_single, bench_apply_row_id, bench_shot_table, bench_mask_to_offset_ranges, bench_bitmap_mask_density);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     benches,
     bench_creation,
     bench_get_single,
     bench_apply_row_id,
-    bench_shot_table
+    bench_shot_table,
+    bench_mask_to_offset_ranges,
+    bench_bitmap_mask_density
 );
 criterion_main!(benches);
