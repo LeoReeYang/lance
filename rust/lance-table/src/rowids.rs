@@ -612,34 +612,11 @@ impl RowIdSequence {
         let finite_allow_list = mask
             .allow_list()
             .and_then(|allow_list| allow_list.len().map(|len| (allow_list, len)));
-        // Bitmap segment count and span, driving the per-id path below.
-        let (mut bitmap_segments, mut bitmap_span) = (0u64, 0u64);
-        for segment in &self.0 {
-            if let U64Segment::RangeWithBitmap { range, .. } = segment {
-                bitmap_segments += 1;
-                bitmap_span += range.end - range.start;
-            }
-        }
-        // Per-id work grows with the selection size; the range-based path
-        // grows with the bitmap span. This is a heuristic, not a proof:
-        // selections broader than the span keep the old path, keeping each
-        // call near the old range-based cost instead of paying per-id scans
-        // over a dataset-wide selection in every fragment.
-        let per_id = finite_allow_list.is_some_and(|(_, num_selected)| num_selected <= bitmap_span);
-        // Rescanning the whole selection in every bitmap segment would cost
-        // O(segments x selected). With more than one bitmap segment, the
-        // sorted selection is materialized once so each segment only visits
-        // its own id range (binary search); a single bitmap segment streams
-        // the selection directly with no copy.
-        let selected_ids: Option<Vec<u64>> = if per_id && bitmap_segments > 1 {
-            finite_allow_list.and_then(|(allow_list, _)| {
-                allow_list
-                    .row_addrs()
-                    .map(|selected| selected.map(u64::from).collect())
-            })
-        } else {
-            None
-        };
+        // Bitmap segment count/span and the shared selection below are
+        // computed lazily on the first bitmap segment: masks and sequences
+        // that never reach the per-id path pay nothing extra.
+        let mut bitmap_info: Option<(u64, u64)> = None;
+        let mut shared_cache: Option<Option<Vec<u64>>> = None;
         for segment in &self.0 {
             match segment {
                 U64Segment::Range(range) => {
@@ -699,42 +676,67 @@ impl RowIdSequence {
                     // When the mask is a finite allow-list, walk the selected
                     // ids directly instead of materializing the whole range.
                     // `row_addrs()` yields addresses in sorted order, so bitmap
-                    // prefix counts accumulate incrementally. Selections
-                    // broader than the bitmap span keep the range-based path
-                    // below (see above), as do masks without finite
+                    // prefix counts accumulate incrementally. Per-id work grows
+                    // with the selection size while the range path grows with
+                    // the bitmap span, so selections broader than the span keep
+                    // the old range-based path below (a heuristic holding each
+                    // call near the old cost), as do masks without finite
                     // cardinality (e.g. full-fragment markers).
-                    if let Some(ids) = selected_ids.as_ref() {
-                        // Pre-materialized selection: visit only this
-                        // segment's id range.
-                        let start = ids.partition_point(|id| *id < range.start);
-                        let end = ids.partition_point(|id| *id < range.end);
-                        let offset_start = offset;
-                        offset += bitmap.count_ones() as u64;
-                        ranges.extend(bitmap_selected_offsets(
-                            ids[start..end].iter().copied(),
-                            range,
-                            bitmap,
-                            offset_start,
-                        ));
-                        continue;
-                    }
-                    if per_id
-                        && let Some((allow_list, _)) = finite_allow_list
-                        && let Some(selected) = allow_list.row_addrs()
-                    {
-                        let offset_start = offset;
-                        offset += bitmap.count_ones() as u64;
-                        let in_range = selected.filter_map(|address| {
-                            let row_id = u64::from(address);
-                            range.contains(&row_id).then_some(row_id)
-                        });
-                        ranges.extend(bitmap_selected_offsets(
-                            in_range,
-                            range,
-                            bitmap,
-                            offset_start,
-                        ));
-                        continue;
+                    if let Some((allow_list, num_selected)) = finite_allow_list {
+                        // Count/span computed once, on first use, so masks and
+                        // sequences that never take this path pay nothing extra.
+                        let (bitmap_segments, bitmap_span) =
+                            *bitmap_info.get_or_insert_with(|| {
+                                let mut info = (0u64, 0u64);
+                                for segment in &self.0 {
+                                    if let U64Segment::RangeWithBitmap { range, .. } = segment {
+                                        info.0 += 1;
+                                        info.1 += range.end - range.start;
+                                    }
+                                }
+                                info
+                            });
+                        if num_selected <= bitmap_span {
+                            // Rescanning the whole selection in every bitmap
+                            // segment would cost O(segments x selected). With
+                            // more than one bitmap segment, the sorted selection
+                            // is materialized once so each segment only visits
+                            // its own id range (binary search); a single bitmap
+                            // segment streams the selection directly with no copy.
+                            let offset_start = offset;
+                            if bitmap_segments > 1 {
+                                let cached = shared_cache.get_or_insert_with(|| {
+                                    allow_list
+                                        .row_addrs()
+                                        .map(|selected| selected.map(u64::from).collect())
+                                });
+                                if let Some(ids) = cached {
+                                    offset += bitmap.count_ones() as u64;
+                                    let start = ids.partition_point(|id| *id < range.start);
+                                    let end = ids.partition_point(|id| *id < range.end);
+                                    ranges.extend(bitmap_selected_offsets(
+                                        ids[start..end].iter().copied(),
+                                        range,
+                                        bitmap,
+                                        offset_start,
+                                    ));
+                                    continue;
+                                }
+                            } else if let Some(selected) = allow_list.row_addrs() {
+                                offset += bitmap.count_ones() as u64;
+                                let in_range = selected.filter_map(|address| {
+                                    let row_id = u64::from(address);
+                                    range.contains(&row_id).then_some(row_id)
+                                });
+                                ranges.extend(bitmap_selected_offsets(
+                                    in_range,
+                                    range,
+                                    bitmap,
+                                    offset_start,
+                                ));
+                                continue;
+                            }
+                        }
                     }
                     let mut ids = RowAddrTreeMap::from(range.clone());
                     let offset_start = offset;
