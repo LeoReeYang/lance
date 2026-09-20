@@ -623,11 +623,47 @@ fn bench_bitmap_mask_density(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_broad_dataset_wide_mask(c: &mut Criterion) {
+    // Regression scenario: a dataset-wide allow-list applied to one
+    // small-span fragment. The selection is far broader than the span, so
+    // the call must keep the old range-based path instead of scanning ~10M
+    // selected ids for a 100k-span segment.
+    let frag_start = 5_000_000_u64;
+    let span = 100_000_u64;
+    let live: Vec<u64> = (frag_start..frag_start + span)
+        .filter(|id| id % 17 != 0)
+        .collect();
+    let sequence = RowIdSequence::from(live.as_slice());
+    assert!(matches!(
+        sequence.segments(),
+        [lance_table::rowids::segment::U64Segment::RangeWithBitmap { .. }]
+    ));
+
+    let mut wide: Vec<u64> = (0..10_000_000)
+        .filter(|id| id % 17 != 0 && (*id < frag_start || *id >= frag_start + span))
+        .collect();
+    wide.extend(live.iter().copied());
+    let wide_mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(wide.as_slice()));
+    let local_mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(live.as_slice()));
+
+    let mut group = c.benchmark_group("broad_mask_fragment");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_millis(300));
+    group.measurement_time(std::time::Duration::from_secs(2));
+    group.bench_function("fragment-only", |b| {
+        b.iter(|| std::hint::black_box(sequence.mask_to_offset_ranges(&local_mask)));
+    });
+    group.bench_function("dataset-wide", |b| {
+        b.iter(|| std::hint::black_box(sequence.mask_to_offset_ranges(&wide_mask)));
+    });
+    group.finish();
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name = benches;
     config=Criterion::default().with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
-    targets=bench_creation, bench_get_single, bench_apply_row_id, bench_shot_table, bench_mask_to_offset_ranges, bench_bitmap_mask_density);
+    targets=bench_creation, bench_get_single, bench_apply_row_id, bench_shot_table, bench_mask_to_offset_ranges, bench_bitmap_mask_density, bench_broad_dataset_wide_mask);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     benches,
@@ -636,6 +672,7 @@ criterion_group!(
     bench_apply_row_id,
     bench_shot_table,
     bench_mask_to_offset_ranges,
-    bench_bitmap_mask_density
+    bench_bitmap_mask_density,
+    bench_broad_dataset_wide_mask
 );
 criterion_main!(benches);

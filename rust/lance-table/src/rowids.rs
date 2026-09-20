@@ -621,9 +621,10 @@ impl RowIdSequence {
             }
         }
         // Per-id work grows with the selection size; the range-based path
-        // grows with the bitmap span. Selections broader than the span keep
-        // the old path, so one call never costs more than before and broad
-        // queries cannot regress in total across fragments.
+        // grows with the bitmap span. This is a heuristic, not a proof:
+        // selections broader than the span keep the old path, keeping each
+        // call near the old range-based cost instead of paying per-id scans
+        // over a dataset-wide selection in every fragment.
         let per_id = finite_allow_list.is_some_and(|(_, num_selected)| num_selected <= bitmap_span);
         // Rescanning the whole selection in every bitmap segment would cost
         // O(segments x selected). With more than one bitmap segment, the
