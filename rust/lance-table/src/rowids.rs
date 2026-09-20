@@ -1818,6 +1818,226 @@ mod test {
         assert_eq!(ranges, vec![]);
     }
 
+    /// Brute-force oracle for `mask_to_offset_ranges`: expand every live id
+    /// in order and keep the offsets selected by the mask. It shares no logic
+    /// with the optimized paths, so agreement proves semantic equivalence.
+    /// Like the implementation, offsets are grouped per segment, so ranges
+    /// adjacent across a segment boundary stay split (e.g. `0..5, 5..1025`).
+    fn oracle_mask_to_offset_ranges(
+        sequence: &RowIdSequence,
+        mask: &RowAddrMask,
+    ) -> Vec<Range<u64>> {
+        let mut ranges = Vec::new();
+        let mut offset = 0u64;
+        for segment in &sequence.0 {
+            let selected = segment
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row_id)| mask.selected(row_id).then_some(offset + i as u64));
+            ranges.extend(GroupingIterator::new(selected));
+            offset += segment.len() as u64;
+        }
+        ranges
+    }
+
+    /// Deterministic xorshift64* generator; keeps randomized tests free of new
+    /// dev-dependencies.
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0.max(1);
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            debug_assert!(bound > 0);
+            self.next() % bound
+        }
+    }
+
+    /// Random multi-segment sequence over disjoint id ranges. Returns the
+    /// sequence, every hole id (in-span but absent), and the first id past
+    /// the end, for mask generation.
+    fn random_sequence(rng: &mut TestRng) -> (RowIdSequence, Vec<u64>, u64) {
+        let mut segments = Vec::new();
+        let mut holes = Vec::new();
+        let mut cursor = rng.below(1_000);
+        for _ in 0..(1 + rng.below(4)) {
+            match rng.below(5) {
+                // Contiguous range.
+                0 => {
+                    let span = 1 + rng.below(300);
+                    segments.push(U64Segment::Range(cursor..cursor + span));
+                    cursor += span;
+                }
+                // Bitmap with 10%-90% holes; first slot stays live so the
+                // segment is never empty.
+                1 | 2 => {
+                    let span = (50 + rng.below(1_950)) as usize;
+                    let hole_pct = 10 + rng.below(81);
+                    let present: Vec<bool> = (0..span)
+                        .map(|i| i == 0 || rng.next() % 100 >= hole_pct)
+                        .collect();
+                    for (i, live) in present.iter().enumerate() {
+                        if !live {
+                            holes.push(cursor + i as u64);
+                        }
+                    }
+                    segments.push(U64Segment::RangeWithBitmap {
+                        range: cursor..cursor + span as u64,
+                        bitmap: present.as_slice().into(),
+                    });
+                    cursor += span as u64;
+                }
+                // Range with a few holes.
+                3 => {
+                    let span = 20 + rng.below(180);
+                    let mut hole_ids: Vec<u64> = (0..1 + rng.below(5).min(span - 1))
+                        .map(|_| cursor + rng.below(span))
+                        .collect();
+                    hole_ids.sort_unstable();
+                    hole_ids.dedup();
+                    if hole_ids.len() as u64 == span {
+                        hole_ids.pop();
+                    }
+                    holes.extend(hole_ids.clone());
+                    segments.push(U64Segment::RangeWithHoles {
+                        range: cursor..cursor + span,
+                        holes: hole_ids.into(),
+                    });
+                    cursor += span;
+                }
+                // Sorted or unsorted array of a few ids.
+                _ => {
+                    let count = 1 + rng.below(8);
+                    let span = count * 3 + 1;
+                    let mut ids: Vec<u64> = (0..count).map(|_| cursor + rng.below(span)).collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    if rng.below(2) == 0 {
+                        // Fisher-Yates shuffle for the unsorted encoding.
+                        for i in (1..ids.len()).rev() {
+                            ids.swap(i, rng.below(i as u64 + 1) as usize);
+                        }
+                        segments.push(U64Segment::Array(ids.into()));
+                    } else {
+                        segments.push(U64Segment::SortedArray(ids.into()));
+                    }
+                    cursor += span;
+                }
+            }
+        }
+        (RowIdSequence(segments), holes, cursor)
+    }
+
+    /// Random allow-list mixing live ids, hole ids, and ids outside every
+    /// segment.
+    fn random_allow_mask(
+        rng: &mut TestRng,
+        live: &[u64],
+        holes: &[u64],
+        past_end: u64,
+        count: usize,
+    ) -> RowAddrMask {
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            match rng.below(10) {
+                0..=5 => ids.push(live[rng.below(live.len() as u64) as usize]),
+                6..=7 if !holes.is_empty() => {
+                    ids.push(holes[rng.below(holes.len() as u64) as usize])
+                }
+                8 if live[0] > 0 => ids.push(live[0] - 1 - rng.below(live[0].min(500))),
+                _ => ids.push(past_end + rng.below(500)),
+            }
+        }
+        RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(ids.as_slice()))
+    }
+
+    #[test]
+    fn test_mask_to_offset_ranges_matches_brute_force() {
+        for seed in 0..50u64 {
+            let mut rng = TestRng(seed);
+            let (sequence, holes, past_end) = random_sequence(&mut rng);
+            let live: Vec<u64> = sequence.iter().collect();
+            assert!(!live.is_empty(), "seed {seed} generated no live ids");
+
+            let blocked: Vec<u64> = (0..30.min(live.len()))
+                .map(|_| live[rng.below(live.len() as u64) as usize])
+                .collect();
+            let mut masks = vec![
+                RowAddrMask::allow_nothing(),
+                RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(live.as_slice())),
+                RowAddrMask::default(),
+                RowAddrMask::from_block(RowAddrTreeMap::new()),
+                RowAddrMask::from_block(RowAddrTreeMap::from_iter(blocked.as_slice())),
+            ];
+            for _ in 0..3 {
+                let count = 1 + rng.below(20) as usize;
+                masks.push(random_allow_mask(&mut rng, &live, &holes, past_end, count));
+            }
+            let medium = live.len().clamp(1, 1_000);
+            masks.push(random_allow_mask(&mut rng, &live, &holes, past_end, medium));
+            // Only missing ids: holes plus ids outside every segment.
+            if holes.is_empty() {
+                let beyond: Vec<u64> = (0..50).map(|i| past_end + i).collect();
+                masks.push(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+                    beyond.as_slice(),
+                )));
+            } else {
+                masks.push(random_allow_mask(&mut rng, &holes, &holes, past_end, 50));
+            }
+
+            for (i, mask) in masks.iter().enumerate() {
+                assert_eq!(
+                    sequence.mask_to_offset_ranges(mask),
+                    oracle_mask_to_offset_ranges(&sequence, mask),
+                    "seed {seed} mask {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mask_to_offset_ranges_multiple_bitmap_segments() {
+        // Live ids and their offsets:
+        // seg0 Range(0..5):                0..5      -> offsets 0..5
+        // seg1 bitmap 100..110, holes
+        //   102, 107: 100,101,103,104,105,106,108,109 -> offsets 5..13
+        // seg2 bitmap 200..205, hole 200: 201,202,203,204 -> offsets 13..17
+        let bitmap_a: Vec<bool> = (0..10).map(|i| i != 2 && i != 7).collect();
+        let bitmap_b: Vec<bool> = (0..5).map(|i| i != 0).collect();
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::RangeWithBitmap {
+                range: 100..110,
+                bitmap: bitmap_a.as_slice().into(),
+            },
+            U64Segment::RangeWithBitmap {
+                range: 200..205,
+                bitmap: bitmap_b.as_slice().into(),
+            },
+        ]);
+        // Hits in every segment plus hole ids (102, 107, 200) and ids
+        // outside every segment (50, 1_000).
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[
+            0, 4, 100, 103, 109, 201, 204, 102, 107, 200, 50, 1_000,
+        ]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        // Offsets 0, 4, 5, 7, 12, 13, 16. Ranges stay split at the segment
+        // boundaries (4..5 vs 5..6, 12..13 vs 13..14), matching the old path.
+        assert_eq!(ranges, vec![0..1, 4..5, 5..6, 7..8, 12..13, 13..14, 16..17]);
+        assert_eq!(ranges, oracle_mask_to_offset_ranges(&sequence, &mask));
+
+        // A mask with no live ids selects nothing even across segments.
+        let missing = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[102, 200, 50, 1_000]));
+        assert!(sequence.mask_to_offset_ranges(&missing).is_empty());
+    }
+
     #[test]
     fn test_row_id_sequence_rechunk_with_empty_segments() {
         // equal case (segment exactly fills remaining space)
