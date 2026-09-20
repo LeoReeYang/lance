@@ -699,15 +699,10 @@ impl RowIdSequence {
                     // When the mask is a finite allow-list, walk the selected
                     // ids directly instead of materializing the whole range.
                     // `row_addrs()` yields addresses in sorted order, so bitmap
-                    // prefix counts accumulate incrementally. Density
-                    // measurements on a 1M-span segment (old TreeMap path vs.
-                    // this path: 1 hit 3.52ms vs 5.8us, 100k hits 4.75ms vs
-                    // 2.11ms, 400k hits 8.65ms vs 7.17ms, full 10.65ms vs
-                    // 10.06ms, no regression) cover selections up to the span;
-                    // broader selections keep the range-based path below, so
-                    // one call never costs more than before. Masks without
-                    // finite cardinality (e.g. full-fragment markers) also
-                    // use the range-based path.
+                    // prefix counts accumulate incrementally. Selections
+                    // broader than the bitmap span keep the range-based path
+                    // below (see above), as do masks without finite
+                    // cardinality (e.g. full-fragment markers).
                     if let Some(ids) = selected_ids.as_ref() {
                         // Pre-materialized selection: visit only this
                         // segment's id range.
