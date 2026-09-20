@@ -612,6 +612,26 @@ impl RowIdSequence {
         let finite_allow_list = mask
             .allow_list()
             .filter(|allow_list| allow_list.len().is_some());
+        // Rescanning the whole selection in every bitmap segment would cost
+        // O(segments x selected). With more than one bitmap segment, the
+        // sorted selection is materialized once so each segment only visits
+        // its own id range (binary search); a single bitmap segment streams
+        // the selection directly with no copy.
+        let multiple_bitmap_segments = self
+            .0
+            .iter()
+            .filter(|segment| matches!(segment, U64Segment::RangeWithBitmap { .. }))
+            .count()
+            > 1;
+        let selected_ids: Option<Vec<u64>> = if multiple_bitmap_segments {
+            finite_allow_list.and_then(|allow_list| {
+                allow_list
+                    .row_addrs()
+                    .map(|selected| selected.map(u64::from).collect())
+            })
+        } else {
+            None
+        };
         for segment in &self.0 {
             match segment {
                 U64Segment::Range(range) => {
@@ -669,39 +689,47 @@ impl RowIdSequence {
                 }
                 U64Segment::RangeWithBitmap { range, bitmap } => {
                     // When the mask is a finite allow-list, walk the selected
-                    // ids directly. `row_addrs()` yields addresses in sorted
-                    // order, so bitmap prefix counts can be accumulated
-                    // incrementally. Density measurements on a 1M-span segment
-                    // (old TreeMap path vs. this path: 1 hit 3.52ms vs 5.8us,
-                    // 100k hits 4.75ms vs 2.11ms, 400k hits 8.65ms vs 7.17ms,
-                    // full 10.65ms vs 10.06ms, no regression) showed the
-                    // per-id path is faster-or-equal across the whole density
-                    // range, so there is no density threshold here. Masks
-                    // without finite cardinality (e.g. full-fragment markers)
-                    // still use the range-based path below.
+                    // ids directly instead of materializing the whole range.
+                    // `row_addrs()` yields addresses in sorted order, so bitmap
+                    // prefix counts accumulate incrementally. Density
+                    // measurements on a 1M-span segment (old TreeMap path vs.
+                    // this path: 1 hit 3.52ms vs 5.8us, 100k hits 4.75ms vs
+                    // 2.11ms, 400k hits 8.65ms vs 7.17ms, full 10.65ms vs
+                    // 10.06ms, no regression) showed the per-id path is
+                    // faster-or-equal across the tested densities, so there is
+                    // no density threshold here. Masks without finite
+                    // cardinality (e.g. full-fragment markers) still use the
+                    // range-based path below.
+                    if let Some(ids) = selected_ids.as_ref() {
+                        // Pre-materialized selection: visit only this
+                        // segment's id range.
+                        let start = ids.partition_point(|id| *id < range.start);
+                        let end = ids.partition_point(|id| *id < range.end);
+                        let offset_start = offset;
+                        offset += bitmap.count_ones() as u64;
+                        ranges.extend(bitmap_selected_offsets(
+                            ids[start..end].iter().copied(),
+                            range,
+                            bitmap,
+                            offset_start,
+                        ));
+                        continue;
+                    }
                     if let Some(allow_list) = finite_allow_list
                         && let Some(selected) = allow_list.row_addrs()
                     {
                         let offset_start = offset;
                         offset += bitmap.count_ones() as u64;
-                        let mut previous_position = 0;
-                        let mut live_before = 0;
-                        let selected_offsets = selected.filter_map(|address| {
+                        let in_range = selected.filter_map(|address| {
                             let row_id = u64::from(address);
-                            if !range.contains(&row_id) {
-                                return None;
-                            }
-                            let position = (row_id - range.start) as usize;
-                            if !bitmap.get(position) {
-                                return None;
-                            }
-                            live_before += bitmap
-                                .slice(previous_position, position - previous_position)
-                                .count_ones();
-                            previous_position = position;
-                            Some(offset_start + live_before as u64)
+                            range.contains(&row_id).then_some(row_id)
                         });
-                        ranges.extend(GroupingIterator::new(selected_offsets));
+                        ranges.extend(bitmap_selected_offsets(
+                            in_range,
+                            range,
+                            bitmap,
+                            offset_start,
+                        ));
                         continue;
                     }
                     let mut ids = RowAddrTreeMap::from(range.clone());
@@ -801,6 +829,31 @@ impl<I: Iterator<Item = u64>> Iterator for GroupingIterator<I> {
         }
         self.cur_range.take()
     }
+}
+
+/// Offsets of sorted `ids` (all within `range`) via incremental bitmap
+/// prefix counts, grouped into ranges. Every id is visited once; the bitmap
+/// slice between consecutive ids is popcounted exactly once overall.
+fn bitmap_selected_offsets(
+    ids: impl Iterator<Item = u64>,
+    range: &Range<u64>,
+    bitmap: &bitmap::Bitmap,
+    offset_start: u64,
+) -> Vec<Range<u64>> {
+    let mut previous_position = 0;
+    let mut live_before = 0;
+    let selected_offsets = ids.filter_map(|row_id| {
+        let position = (row_id - range.start) as usize;
+        if !bitmap.get(position) {
+            return None;
+        }
+        live_before += bitmap
+            .slice(previous_position, position - previous_position)
+            .count_ones();
+        previous_position = position;
+        Some(offset_start + live_before as u64)
+    });
+    GroupingIterator::new(selected_offsets).collect()
 }
 
 impl From<&RowIdSequence> for RowAddrTreeMap {
