@@ -611,20 +611,27 @@ impl RowIdSequence {
         let mut ranges = Vec::new();
         let finite_allow_list = mask
             .allow_list()
-            .filter(|allow_list| allow_list.len().is_some());
+            .and_then(|allow_list| allow_list.len().map(|len| (allow_list, len)));
+        // Bitmap segment count and span, driving the per-id path below.
+        let (mut bitmap_segments, mut bitmap_span) = (0u64, 0u64);
+        for segment in &self.0 {
+            if let U64Segment::RangeWithBitmap { range, .. } = segment {
+                bitmap_segments += 1;
+                bitmap_span += range.end - range.start;
+            }
+        }
+        // Per-id work grows with the selection size; the range-based path
+        // grows with the bitmap span. Selections broader than the span keep
+        // the old path, so one call never costs more than before and broad
+        // queries cannot regress in total across fragments.
+        let per_id = finite_allow_list.is_some_and(|(_, num_selected)| num_selected <= bitmap_span);
         // Rescanning the whole selection in every bitmap segment would cost
         // O(segments x selected). With more than one bitmap segment, the
         // sorted selection is materialized once so each segment only visits
         // its own id range (binary search); a single bitmap segment streams
         // the selection directly with no copy.
-        let multiple_bitmap_segments = self
-            .0
-            .iter()
-            .filter(|segment| matches!(segment, U64Segment::RangeWithBitmap { .. }))
-            .count()
-            > 1;
-        let selected_ids: Option<Vec<u64>> = if multiple_bitmap_segments {
-            finite_allow_list.and_then(|allow_list| {
+        let selected_ids: Option<Vec<u64>> = if per_id && bitmap_segments > 1 {
+            finite_allow_list.and_then(|(allow_list, _)| {
                 allow_list
                     .row_addrs()
                     .map(|selected| selected.map(u64::from).collect())
@@ -695,11 +702,11 @@ impl RowIdSequence {
                     // measurements on a 1M-span segment (old TreeMap path vs.
                     // this path: 1 hit 3.52ms vs 5.8us, 100k hits 4.75ms vs
                     // 2.11ms, 400k hits 8.65ms vs 7.17ms, full 10.65ms vs
-                    // 10.06ms, no regression) showed the per-id path is
-                    // faster-or-equal across the tested densities, so there is
-                    // no density threshold here. Masks without finite
-                    // cardinality (e.g. full-fragment markers) still use the
-                    // range-based path below.
+                    // 10.06ms, no regression) cover selections up to the span;
+                    // broader selections keep the range-based path below, so
+                    // one call never costs more than before. Masks without
+                    // finite cardinality (e.g. full-fragment markers) also
+                    // use the range-based path.
                     if let Some(ids) = selected_ids.as_ref() {
                         // Pre-materialized selection: visit only this
                         // segment's id range.
@@ -715,7 +722,8 @@ impl RowIdSequence {
                         ));
                         continue;
                     }
-                    if let Some(allow_list) = finite_allow_list
+                    if per_id
+                        && let Some((allow_list, _)) = finite_allow_list
                         && let Some(selected) = allow_list.row_addrs()
                     {
                         let offset_start = offset;
@@ -2035,6 +2043,14 @@ mod test {
             }
             let medium = live.len().clamp(1, 1_000);
             masks.push(random_allow_mask(&mut rng, &live, &holes, past_end, medium));
+            // Broader than the bitmap span: keeps the old range-based path.
+            let min_live = live.iter().min().copied().unwrap_or(0);
+            let cover = past_end.saturating_sub(min_live).max(1);
+            let mut broad: Vec<u64> = live.clone();
+            broad.extend(past_end..past_end + 2 * cover + 50);
+            masks.push(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+                broad.as_slice(),
+            )));
             // Only missing ids: holes plus ids outside every segment.
             if holes.is_empty() {
                 let beyond: Vec<u64> = (0..50).map(|i| past_end + i).collect();
@@ -2085,10 +2101,21 @@ mod test {
         // boundaries (4..5 vs 5..6, 12..13 vs 13..14), matching the old path.
         assert_eq!(ranges, vec![0..1, 4..5, 5..6, 7..8, 12..13, 13..14, 16..17]);
         assert_eq!(ranges, oracle_mask_to_offset_ranges(&sequence, &mask));
-
         // A mask with no live ids selects nothing even across segments.
         let missing = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[102, 200, 50, 1_000]));
         assert!(sequence.mask_to_offset_ranges(&missing).is_empty());
+
+        // A selection broader than the bitmap span (17 live + 100 beyond
+        // every segment) keeps the old range-based path; results must match.
+        let mut broad: Vec<u64> = (0..5).collect();
+        broad.extend((100..110).filter(|id| *id != 102 && *id != 107));
+        broad.extend(201..205);
+        broad.extend(10_000..10_100);
+        let broad_mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(broad.as_slice()));
+        assert_eq!(
+            sequence.mask_to_offset_ranges(&broad_mask),
+            oracle_mask_to_offset_ranges(&sequence, &broad_mask)
+        );
     }
 
     #[test]
